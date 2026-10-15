@@ -10,8 +10,13 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <nvs.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
+
+#include <cstring>
+#include <cstdlib>
 
 #include "config.h"
 
@@ -30,7 +35,25 @@ enum class RunState : uint8_t {
 static Preferences prefs;
 static WebServer portal(80);
 static DNSServer dns;
-static WebSocketsClient webSocket;
+static uint16_t lastHttp = 0;
+static unsigned long lastProbeMs = 0;
+
+class KommSocket : public WebSocketsClient {
+ protected:
+  void runCbEvent(WStype_t type, uint8_t* payload, size_t length) override {
+    if (type == WStype_CONNECTED) {
+      lastHttp = _client.cCode;
+      Serial.printf("ws oppen http %u\n", lastHttp);
+    } else if (type == WStype_DISCONNECTED) {
+      unsigned kod = 0;
+      if (payload && length >= 2) kod = (unsigned)((payload[0] << 8) | payload[1]);
+      Serial.printf("ws stangd http %u kod %u\n", lastHttp, kod);
+    }
+    WebSocketsClient::runCbEvent(type, payload, length);
+  }
+};
+
+static KommSocket webSocket;
 
 static RunState state = RunState::Boot;
 static bool useSpk2 = true;
@@ -74,6 +97,13 @@ static const char* stateName(RunState value) {
     case RunState::Error: return "FEL";
   }
   return "?";
+}
+
+static void setState(RunState next) {
+  if (next == state) return;
+  state = next;
+  uiDirty = true;
+  Serial.printf("state %s\n", stateName(state));
 }
 
 static void foldUtf8(String& out, const char* utf8) {
@@ -256,16 +286,10 @@ static void sendPtt(const char* edge) {
 
 static void applyStatus(const char* name) {
   if (pttHeld) return;
-  if (strcmp(name, "speaking") == 0) {
-    state = RunState::Speak;
-  } else if (strcmp(name, "thinking") == 0) {
-    state = RunState::Think;
-  } else if (strcmp(name, "idle") == 0) {
-    state = RunState::Idle;
-  } else if (strcmp(name, "error") == 0) {
-    state = RunState::Error;
-  }
-  uiDirty = true;
+  if (strcmp(name, "speaking") == 0) setState(RunState::Speak);
+  else if (strcmp(name, "thinking") == 0) setState(RunState::Think);
+  else if (strcmp(name, "idle") == 0) setState(RunState::Idle);
+  else if (strcmp(name, "error") == 0) setState(RunState::Error);
   markActivity();
 }
 
@@ -275,7 +299,7 @@ static void onTextMessage(const char* payload, size_t length) {
   const char* type = doc["type"] | "";
   if (strcmp(type, "hello.ok") == 0) {
     sessionReady = true;
-    if (!pttHeld) state = RunState::Idle;
+    if (!pttHeld) setState(RunState::Idle);
     detailLine = "session";
     uiDirty = true;
     markActivity();
@@ -305,9 +329,11 @@ static void onTextMessage(const char* payload, size_t length) {
     return;
   }
   if (strcmp(type, "error") == 0) {
-    state = RunState::Error;
+    setState(RunState::Error);
     detailLine = "";
     foldUtf8(detailLine, doc["message"] | "fel");
+    const char* code = doc["code"] | "";
+    if (code[0]) Serial.printf("ws fel %s\n", code);
     sessionReady = false;
     uiDirty = true;
     return;
@@ -319,16 +345,14 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       sessionReady = false;
-      state = RunState::Connecting;
-      uiDirty = true;
+      setState(RunState::Connecting);
       sendHello();
       break;
     case WStype_DISCONNECTED:
       sessionReady = false;
       if (state != RunState::Provision && state != RunState::Wifi) {
-        state = RunState::Connecting;
         detailLine = "bruten lank";
-        uiDirty = true;
+        setState(RunState::Connecting);
       }
       break;
     case WStype_TEXT:
@@ -337,28 +361,82 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_BIN:
       if (!pttHeld) {
         ringPush(payload, length);
-        if (state != RunState::Speak) state = RunState::Speak;
-        uiDirty = true;
+        setState(RunState::Speak);
         markActivity();
       }
       break;
     case WStype_ERROR:
       detailLine = "ws-fel";
-      state = RunState::Error;
-      uiDirty = true;
+      setState(RunState::Error);
       break;
     default:
       break;
   }
 }
 
-static void startWebSocket() {
-  if (deviceToken.length() == 0 || relayHost.length() == 0) {
-    state = RunState::Error;
-    detailLine = "saknar token/vard";
-    uiDirty = true;
+static bool nvsString(nvs_handle_t handle, const char* key, String& out) {
+  size_t len = 0;
+  esp_err_t err = nvs_get_str(handle, key, nullptr, &len);
+  if (err == ESP_ERR_NVS_NOT_FOUND) return false;
+  if (err != ESP_OK || len < 2 || len > 128) {
+    if (err != ESP_OK) Serial.printf("nvs %s fel %d\n", key, (int)err);
+    return false;
+  }
+  char buf[128];
+  err = nvs_get_str(handle, key, buf, &len);
+  if (err != ESP_OK) return false;
+  out = buf;
+  return true;
+}
+
+static void logLink() {
+  lastProbeMs = millis();
+  if (!useTls) {
+    Serial.printf("tls av %s:%u\n", relayHost.c_str(), (unsigned)relayPort);
     return;
   }
+  WiFiClientSecure probe;
+  probe.setCACert(KOMM_CA_CERT);
+  probe.setTimeout(5);
+  char errText[48];
+  errText[0] = 0;
+  if (!probe.connect(relayHost.c_str(), relayPort, 8000)) {
+    int err = probe.lastError(errText, sizeof(errText));
+    Serial.printf("tls fel %d %s:%u\n", err, relayHost.c_str(), (unsigned)relayPort);
+    probe.stop();
+    return;
+  }
+  Serial.printf("tls ok %s:%u\n", relayHost.c_str(), (unsigned)relayPort);
+  probe.print(F("GET /ws HTTP/1.1\r\nHost: "));
+  probe.print(relayHost);
+  probe.printf(":%u\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n", (unsigned)relayPort);
+  probe.print(F("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nAuthorization: Bearer "));
+  probe.print(deviceToken);
+  probe.print(F("\r\n\r\n"));
+  char line[32];
+  size_t n = 0;
+  while (n + 1 < sizeof(line)) {
+    int c = probe.read();
+    if (c < 0 || c == '\n' || c == '\r') break;
+    line[n++] = (char)c;
+  }
+  line[n] = 0;
+  int http = 0;
+  const char* space = strchr(line, ' ');
+  if (space) http = atoi(space + 1);
+  lastHttp = (uint16_t)http;
+  Serial.printf("ws http %d\n", http);
+  probe.stop();
+}
+
+static void startWebSocket() {
+  if (deviceToken.length() == 0 || relayHost.length() == 0) {
+    detailLine = "saknar token/vard";
+    setState(RunState::Error);
+    return;
+  }
+  Serial.printf("wifi %s rssi %d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  logLink();
   snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s\r\n", deviceToken.c_str());
   webSocket.setExtraHeaders(authHeader);
   webSocket.onEvent(onWs);
@@ -369,18 +447,27 @@ static void startWebSocket() {
     webSocket.begin(relayHost.c_str(), relayPort, "/ws");
   }
   wsStarted = true;
-  state = RunState::Connecting;
-  uiDirty = true;
+  setState(RunState::Connecting);
 }
 
 static void loadConfig() {
-  wifiSsid = prefs.getString("ssid", "");
-  wifiPass = prefs.getString("pass", "");
-  relayHost = prefs.getString("host", KOMM_RELAY_HOST);
-  deviceToken = prefs.getString("token", KOMM_DEVICE_TOKEN);
-  relayPort = prefs.getUShort("port", KOMM_RELAY_PORT);
-  useTls = prefs.getBool("tls", KOMM_USE_TLS != 0);
-  useSpk2 = prefs.getBool("spk2", false);
+  relayHost = KOMM_RELAY_HOST;
+  deviceToken = KOMM_DEVICE_TOKEN;
+  useSpk2 = false;
+  nvs_handle_t handle = 0;
+  if (nvs_open("komm", NVS_READONLY, &handle) == ESP_OK) {
+    String value;
+    if (nvsString(handle, "ssid", value)) wifiSsid = value;
+    if (nvsString(handle, "pass", value)) wifiPass = value;
+    if (nvsString(handle, "host", value)) relayHost = value;
+    if (nvsString(handle, "token", value)) deviceToken = value;
+    uint16_t port = 0;
+    if (nvs_get_u16(handle, "port", &port) == ESP_OK && port) relayPort = port;
+    uint8_t flag = 0;
+    if (nvs_get_u8(handle, "tls", &flag) == ESP_OK) useTls = flag != 0;
+    if (nvs_get_u8(handle, "spk2", &flag) == ESP_OK) useSpk2 = flag != 0;
+    nvs_close(handle);
+  }
 #ifdef KOMM_WIFI_SSID
   if (wifiSsid.length() == 0) wifiSsid = KOMM_WIFI_SSID;
 #ifdef KOMM_WIFI_PASS
@@ -390,7 +477,7 @@ static void loadConfig() {
 }
 
 static void enterProvision() {
-  state = RunState::Provision;
+  setState(RunState::Provision);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
   WiFi.softAP("Kommunikator");
@@ -428,7 +515,7 @@ static void enterProvision() {
 }
 
 static void beginWifi() {
-  state = RunState::Wifi;
+  setState(RunState::Wifi);
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   uiDirty = true;
@@ -447,15 +534,14 @@ static void beginPtt() {
     M5.Speaker.end();
   }
   if (!startMic()) {
-    state = RunState::Error;
     detailLine = "mic";
     pttHeld = false;
     startSpeaker();
-    uiDirty = true;
+    setState(RunState::Error);
     return;
   }
   if (sessionReady) sendPtt("down");
-  state = RunState::Listen;
+  setState(RunState::Listen);
   userLine = "";
   uiDirty = true;
   markActivity();
@@ -473,8 +559,7 @@ static void endPtt() {
     startSpeaker();
     chirp(true);
   }
-  state = sessionReady ? RunState::Think : RunState::Idle;
-  uiDirty = true;
+  setState(sessionReady ? RunState::Think : RunState::Idle);
   markActivity();
 }
 
@@ -522,10 +607,7 @@ static void servicePlayback() {
   if (n == 0) return;
   M5.Speaker.playRaw(playBuf[playIdx], n, PLAYBACK_HZ, false, 1, 0, false);
   playIdx = static_cast<uint8_t>((playIdx + 1) % 3);
-  if (state != RunState::Speak) {
-    state = RunState::Speak;
-    uiDirty = true;
-  }
+  setState(RunState::Speak);
 }
 
 static void maybeSleep() {
@@ -536,14 +618,14 @@ static void maybeSleep() {
   unsigned long quiet = millis() - lastActivity;
   if (quiet > DIM_AFTER_MS) M5.Display.setBrightness(24);
   if (quiet < SLEEP_AFTER_MS) return;
-  state = RunState::Boot;
+  setState(RunState::Boot);
   M5.Display.setBrightness(0);
   webSocket.disconnect();
   WiFi.disconnect(true);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   if (esp_sleep_enable_ext0_wakeup(GPIO_NUM_37, 0) != ESP_OK) {
     M5.Display.setBrightness(24);
-    state = RunState::Idle;
+    setState(RunState::Idle);
     return;
   }
   gpio_hold_en(GPIO_NUM_4);
@@ -597,11 +679,18 @@ void loop() {
   if (state == RunState::Wifi) {
     if (WiFi.status() == WL_CONNECTED) startWebSocket();
   } else if (wsStarted) {
+    if (!webSocket.isConnected() && millis() - lastProbeMs > 3000) logLink();
     webSocket.loop();
   }
 
-  if (M5.BtnA.wasPressed()) beginPtt();
-  if (M5.BtnA.wasReleased()) endPtt();
+  if (M5.BtnA.wasPressed()) {
+    Serial.println("ptt ned");
+    beginPtt();
+  }
+  if (M5.BtnA.wasReleased()) {
+    Serial.println("ptt upp");
+    endPtt();
+  }
   if (M5.BtnB.wasPressed() && !pttHeld && state != RunState::Listen) toggleOutput();
 
   if (pttHeld) serviceCapture();
