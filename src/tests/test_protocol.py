@@ -47,7 +47,10 @@ def test_session_update_matches_documented_shape() -> None:
     assert session["audio"]["input"]["transcription"]["language_hint"] == "sv"
     blob = json.dumps(payload)
     assert "secret-key" not in blob
-    assert "svenska" in session["instructions"]
+    assert "svenska" in session["instructions"].lower()
+    assert "norska" in session["instructions"]
+    assert "danska" in session["instructions"]
+    assert "extremt kortfattat" in session["instructions"]
 
 
 def test_realtime_url_is_the_documented_endpoint() -> None:

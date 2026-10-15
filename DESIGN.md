@@ -43,7 +43,7 @@ Payload som relayn skickar:
 | Fält | Värde | Varför |
 | --- | --- | --- |
 | `voice` | `eve` (env `XAI_VOICE`) | Dokumenterat exempel. Listan hämtas med `GET /v1/tts/voices`. Ingen röst är påhittad. |
-| `instructions` | Kort svensk systemprompt i du-form | Guiden säger att extra språk kan styras i instruktionen. |
+| `instructions` | Du-form med guidens avsnittsordning. Svenska är primärt språk, inget norskt eller danskt inslag, engelska bara som inflikade ord, extremt kort svar. | Guiden säger att extra språk styrs i instruktionen, och att prompten ska ligga nära träningsformen. |
 | `turn_detection.type` | `null` | `input_audio_buffer.commit` finns bara när turn detection är null. PTT är den manuella vägen. |
 | `audio.input.format` | `audio/pcm`, 16000 | PCM-takter som dokumentationen listar: 8000, 16000, 22050, 24000, 32000, 44100, 48000. 16000 beskrivs som wideband, bra för tal. |
 | `audio.output.format` | `audio/pcm`, 24000 | 24000 är default och rekommenderad takt. |
@@ -67,7 +67,7 @@ Upp: SPM1423 PDM → PCM16 mono 16 kHz → binär WebSocket-frame.
 
 Relayn resamplar till `XAI_INPUT_RATE` (default 16000). Lika takt är en kopia. Annars linjär interpolation, ett sample latens över chunk-gränsen, så att det inte klickar.
 
-Ned: xAI PCM16 vid `XAI_OUTPUT_RATE` (default 24000) → relayn resamplar till den takt enheten anmälde i `hello.playback_rate` (firmware: 16000) → binär frame → den inbyggda summern. Hat SPK2 är av tills knapp B väljer den.
+Ned: xAI PCM16 vid `XAI_OUTPUT_RATE` (default 24000) → relayn resamplar till den takt enheten anmälde i `hello.playback_rate` (firmware: 16000) → binär frame → den inbyggda summern. Hat SPK2 är av tills knapp B hålls inne.
 
 Båda takterna måste vara en dokumenterad PCM-takt. 11025 och andra gissningar avvisas.
 
@@ -88,7 +88,7 @@ SPM1423, från StickC-Plus2 pin map:
 
 GPIO0 är både mikrofonklocka och högtalarens LRCLK. M5:s egen mic-text säger att mikrofon och högtalare inte kan användas samtidigt. Kommunikatorn är därför halv-duplex, vilket stämmer med PTT: högtalaren stängs innan PDM startar, och tvärtom efter släpp.
 
-Första enheten har ingen Hat SPK2. Firmware startar därför i summer-läge (passiv summer, GPIO2). M5Unified spelar PCM den vägen. Det blir ett surrande tal, inte en högtalare, och transkriptet på skärmen är det läsbara svaret. Chirpen går samma väg. Knapp B växlar till SPK2 och sparar valet i NVS den dag hatten sätts på. I SPK2-läge tas chirpen med LEDC på GPIO2, så den inte stjäl GPIO0 från mikrofonen.
+Första enheten har ingen Hat SPK2. Firmware startar därför i summer-läge (passiv summer, GPIO2). M5Unified spelar PCM den vägen. Det blir ett surrande tal, inte en högtalare, och transkriptet på skärmen är det läsbara svaret. Chirpen går samma väg. Håll inne knapp B för att växla till SPK2. Valet sparas i NVS den dag hatten sätts på. I SPK2-läge tas chirpen med LEDC på GPIO2, så den inte stjäl GPIO0 från mikrofonen.
 
 Chirp vid tryck är ett stigande pip, vid släpp ett fallande. Det är en TOS-liknande signal, inte ett inspelat ljudeffekt-sample.
 
@@ -123,11 +123,11 @@ Användarens `updated`-händelse är kumulativ och kommer bara om transkriptions
 
 ## Skärm och lägen
 
-ST7789 135×240, liggande (rotation 1), bärnstensfärg på svart. Inbyggda Font2 saknar åäö, så skärmen viker de tecknen till a/o. Protokollet behåller UTF-8.
+ST7789 135×240, liggande (rotation 1), bärnstensfärg på svart. Inbyggda Font2 saknar åäö, så skärmen viker de tecknen till a/o. Protokollet behåller UTF-8. Svaret radbryts under frågan. En triangel nere till höger betyder att fler rader finns.
 
 Lägen: `START`, `PORTAL`, `WIFI`, `KOPPLAR`, `REDO`, `LYSSNAR`, `VANTAR`, `SVARAR`, `FEL`.
 
-Knapp A (GPIO37) är PTT. Knapp B (GPIO39) växlar SPK2/summer. Knapp B intryckt vid start, eller saknat Wi-Fi, öppnar portalen. Knapp C (GPIO35) är väckning/av och används inte som UI.
+Knapp A (GPIO37) är PTT. Knapp B (GPIO39), kort tryck, bläddrar en sida av svaret och går tillbaka till början efter sista sidan. Håll inne B för att växla SPK2/summer. Knapp B intryckt vid start, eller saknat Wi-Fi, öppnar portalen. Knapp C (GPIO35) är väckning/av och används inte som UI.
 
 ## Wi-Fi och token
 
