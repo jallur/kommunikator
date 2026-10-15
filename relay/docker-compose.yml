@@ -1,7 +1,7 @@
 # Run on the Mac Mini (Docker). cloud01 is the fallback.
+# Public name: trek.aldenback.com. TLS terminates in front of this container.
 # Do not run this on Jonas's workstation.
-# TLS terminates in front of this container (reverse proxy). The process
-# itself speaks plain HTTP on 8080 inside the host network.
+# The process itself speaks plain HTTP on 8080 inside the host network.
 
 services:
   relay:

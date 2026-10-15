@@ -25,7 +25,7 @@ PCM16 binärt                        resample, commit/cancel        session.upda
 
 Enheten pratar bara med relayn. Relayn öppnar xAI-socketen och håller API-nyckeln. Ephemeral tokens är dokumenterade för webbläsare som kopplar direkt till xAI. Den vägen används inte, eftersom nyckeln då skulle behöva en väg ut till enheten.
 
-Relayn körs som Docker på en Mac Mini. Samma `relay/docker-compose.yml`. cloud01 är reserven om Minin inte är värden. Jonas arbetsdator är inte värd: den sover och är inte en server. Den ursprungliga gränsen var just den maskinen, inte en Mini som står på. TLS termineras framför containern. Processen lyssnar på HTTP `:8080`.
+Relayn körs som Docker på en Mac Mini. Samma `relay/docker-compose.yml`. cloud01 är reserven om Minin inte är värden. Jonas arbetsdator är inte värd: den sover och är inte en server. Enheten ansluter till `wss://trek.aldenback.com/v1/session` (port 443). TLS termineras framför containern. Processen lyssnar på HTTP `:8080`. Firmware litar på ISRG Root X1, så certet ska vara Let's Encrypt eller en kedja som slutar där.
 
 ## xAI-session
 
@@ -162,7 +162,7 @@ Efter 20 s i `REDO` dimmas bakgrundsbelysningen (GPIO27 ägs av M5GFX). Efter 3 
 4. Formuleringen "null for manual text turns" kan läsas som att null bara gäller text. `input_audio_buffer.commit` säger uttryckligen att commit finns när turn detection-typen är null. Vi skickar `{"type": null}`. Bekräfta mot en riktig session.
 5. Röst: `eve` är exempelvärdet. Välj röst efter `GET /v1/tts/voices` om den ska låta mer som en dator.
 6. SPK2-takt 16 kHz mot den motstridiga M5-specen. PDM 16 kHz mot M5:s 44100-exempel.
-7. TLS-värdnamn och cert mot Mac Minin (eller cloud01 om Minin inte används). Let's Encrypt-roten sitter redan i firmware.
+7. DNS för `trek.aldenback.com` mot Mac Minin (eller cloud01) och ett Let's Encrypt-cert på 443. Firmware har redan ISRG Root X1.
 8. Grok Bot-webhook: adress, auth, payload.
 9. Sessionen tar slut efter 120 minuter. Resumption täcker 30 minuters inaktivitet i relayns minne, inte en omstart av containern.
 10. Skärmtypsnitt med åäö. Nu vikt till a/o.

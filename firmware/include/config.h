@@ -8,7 +8,7 @@
 #include "isrg_root_x1.h"
 
 #ifndef KOMM_RELAY_HOST
-#define KOMM_RELAY_HOST "relay.example.com"
+#define KOMM_RELAY_HOST "trek.aldenback.com"
 #endif
 #ifndef KOMM_RELAY_PORT
 #define KOMM_RELAY_PORT 443

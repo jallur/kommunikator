@@ -47,7 +47,7 @@ docker compose up -d --build
 curl -fsS localhost:8080/healthz
 ```
 
-Sätt en reverse proxy med TLS framför port 8080. Enheten ansluter med `wss` till den värden.
+Sätt en reverse proxy med TLS framför port 8080, på namnet `trek.aldenback.com`. Enheten ansluter med `wss://trek.aldenback.com/v1/session`. Certet ska vara Let's Encrypt. Firmware litar på ISRG Root X1.
 
 `POST /v1/missions` är ett senare gränssnitt mot Grok Bot. Den anropar inget och svarar 501. Se DESIGN.md.
 
@@ -56,7 +56,7 @@ Sätt en reverse proxy med TLS framför port 8080. Enheten ansluter med `wss` ti
 ```bash
 cd firmware
 cp include/secrets.h.example include/secrets.h
-# sätt KOMM_RELAY_HOST och samma KOMM_DEVICE_TOKEN som i relayn
+# KOMM_RELAY_HOST är redan trek.aldenback.com. Sätt samma KOMM_DEVICE_TOKEN som DEVICE_TOKENS.
 python -m platformio run -t upload
 python -m platformio device monitor
 ```
