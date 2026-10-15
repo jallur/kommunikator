@@ -1,0 +1,8 @@
+.pio/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+firmware/include/secrets.h
+relay/.env
