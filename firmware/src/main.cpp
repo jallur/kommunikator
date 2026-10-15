@@ -1,6 +1,6 @@
 // Kommunikator firmware for M5StickC Plus2.
 // Push-to-talk on button A, PDM mic uplink, onboard buzzer playback.
-// Hat SPK2 is optional and off until button B selects it.
+// Button B pages the answer. A long press still selects Hat SPK2.
 // The xAI API key never lives here. The device only knows a relay token.
 
 #include <M5Unified.h>
@@ -107,9 +107,9 @@ static void setState(RunState next) {
   Serial.printf("state %s\n", stateName(state));
 }
 
-static void foldUtf8(String& out, const char* utf8) {
+static void foldUtf8(String& out, const char* utf8, size_t limit) {
   const uint8_t* p = reinterpret_cast<const uint8_t*>(utf8);
-  while (*p && out.length() < 180) {
+  while (*p && out.length() < limit) {
     if (p[0] == 0xC3 && p[1]) {
       switch (p[1]) {
         case 0xA5:
@@ -299,10 +299,92 @@ static void sendPtt(const char* edge) {
   sendJson(doc);
 }
 
+static const int kAnswerRows = 48;
+static const int kAnswerCols = 42;
+static char answerRows[kAnswerRows][kAnswerCols];
+static int answerRowsN = 0;
+static int answerScroll = 0;
+
+static int lineHeightPx() {
+  int h = M5.Display.fontHeight();
+  return h > 0 ? h : 16;
+}
+
+static int answerOriginY() { return 2 + lineHeightPx() * 2; }
+
+static int answerVisible() {
+  int n = (M5.Display.height() - answerOriginY() - 2) / lineHeightPx();
+  return n > 0 ? n : 1;
+}
+
+static void clearAnswerRows() {
+  answerRowsN = 0;
+  answerScroll = 0;
+}
+
+static void rewrapAnswer() {
+  answerRowsN = 0;
+  const char* s = assistantLine.c_str();
+  const int limit = M5.Display.width() - 12;
+  while (*s && answerRowsN < kAnswerRows) {
+    while (*s == ' ') s++;
+    if (*s == '\n') {
+      s++;
+      continue;
+    }
+    if (!*s) break;
+    int take = 0;
+    int breakAt = -1;
+    for (int i = 1; s[i - 1] && s[i - 1] != '\n' && i < kAnswerCols; i++) {
+      if (s[i - 1] == ' ') breakAt = i - 1;
+      char probe[kAnswerCols];
+      memcpy(probe, s, static_cast<size_t>(i));
+      probe[i] = 0;
+      if (M5.Display.textWidth(probe) > limit) break;
+      take = i;
+    }
+    if (take <= 0) break;
+    bool more = s[take] && s[take] != '\n';
+    int use = (more && breakAt > 0) ? breakAt : take;
+    memcpy(answerRows[answerRowsN], s, static_cast<size_t>(use));
+    answerRows[answerRowsN][use] = 0;
+    int end = use;
+    while (end > 0 && answerRows[answerRowsN][end - 1] == ' ') answerRows[answerRowsN][--end] = 0;
+    answerRowsN++;
+    s += use;
+    if (*s == '\n') s++;
+  }
+  int maxScroll = answerRowsN - answerVisible();
+  if (maxScroll < 0) maxScroll = 0;
+  if (answerScroll > maxScroll) answerScroll = maxScroll;
+}
+
+static void scrollAnswer() {
+  int visible = answerVisible();
+  int maxScroll = answerRowsN - visible;
+  if (maxScroll < 0) maxScroll = 0;
+  if (maxScroll == 0) {
+    markActivity();
+    return;
+  }
+  if (answerScroll >= maxScroll) answerScroll = 0;
+  else {
+    answerScroll += visible;
+    if (answerScroll > maxScroll) answerScroll = maxScroll;
+  }
+  uiDirty = true;
+  markActivity();
+}
+
 static void applyStatus(const char* name) {
   if (pttHeld) return;
   if (strcmp(name, "speaking") == 0) setState(RunState::Speak);
-  else if (strcmp(name, "thinking") == 0) setState(RunState::Think);
+  else if (strcmp(name, "thinking") == 0) {
+    assistantLine = "";
+    clearAnswerRows();
+    uiDirty = true;
+    setState(RunState::Think);
+  }
   else if (strcmp(name, "idle") == 0) setState(RunState::Idle);
   else if (strcmp(name, "error") == 0) setState(RunState::Error);
   markActivity();
@@ -327,18 +409,21 @@ static void onTextMessage(const char* payload, size_t length) {
   if (strcmp(type, "transcript.user") == 0) {
     userLine = "";
     if (doc["cumulative"] | true) userLine = "";
-    foldUtf8(userLine, doc["text"] | "");
+    foldUtf8(userLine, doc["text"] | "", 160);
     uiDirty = true;
     return;
   }
   if (strcmp(type, "transcript.assistant") == 0) {
     const char* text = doc["text"] | "";
     bool cumulative = doc["cumulative"] | false;
+    bool fresh = cumulative || assistantLine.length() == 0;
     if (cumulative) {
       if (text[0] == '\0') return;
       assistantLine = "";
     }
-    foldUtf8(assistantLine, text);
+    foldUtf8(assistantLine, text, 1600);
+    if (fresh) answerScroll = 0;
+    rewrapAnswer();
     uiDirty = true;
     markActivity();
     return;
@@ -346,7 +431,7 @@ static void onTextMessage(const char* payload, size_t length) {
   if (strcmp(type, "error") == 0) {
     setState(RunState::Error);
     detailLine = "";
-    foldUtf8(detailLine, doc["message"] | "fel");
+    foldUtf8(detailLine, doc["message"] | "fel", 80);
     const char* code = doc["code"] | "";
     if (code[0]) Serial.printf("ws fel %s\n", code);
     sessionReady = false;
@@ -646,21 +731,61 @@ static void toggleOutput() {
   markActivity();
 }
 
+static void printFitted(const char* text, int maxW) {
+  if (text[0] == 0) return;
+  if (M5.Display.textWidth(text) <= maxW) {
+    M5.Display.print(text);
+    return;
+  }
+  char buf[48];
+  size_t keep = strlen(text);
+  if (keep > sizeof(buf) - 1) keep = sizeof(buf) - 1;
+  while (keep > 1) {
+    memcpy(buf, text, keep);
+    buf[keep] = 0;
+    if (M5.Display.textWidth(buf) <= maxW) break;
+    keep--;
+  }
+  buf[keep] = 0;
+  M5.Display.print(buf);
+}
+
 static void draw() {
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextColor(0xFD20, TFT_BLACK);
+  M5.Display.setTextWrap(false);
+  int lh = lineHeightPx();
   M5.Display.setCursor(4, 2);
-  M5.Display.printf("KOMM  %s", stateName(state));
-  M5.Display.setCursor(4, 20);
-  if (batteryMv > 0) M5.Display.printf("%dmV %s", batteryMv, useSpk2 ? "SPK2" : "SUM");
-  else M5.Display.print(useSpk2 ? "SPK2" : "SUM");
-  M5.Display.setCursor(4, 42);
-  M5.Display.print(">");
-  M5.Display.print(userLine.substring(0, 72));
-  M5.Display.setCursor(4, 78);
-  M5.Display.print(assistantLine.substring(0, 96));
-  M5.Display.setCursor(4, 118);
-  M5.Display.print(detailLine.substring(0, 26));
+  M5.Display.printf("KOMM %s", stateName(state));
+  char meta[24];
+  if (batteryMv > 0) snprintf(meta, sizeof(meta), "%dmV %s", batteryMv, useSpk2 ? "SPK2" : "SUM");
+  else snprintf(meta, sizeof(meta), "%s", useSpk2 ? "SPK2" : "SUM");
+  int metaW = M5.Display.textWidth(meta);
+  M5.Display.setCursor(M5.Display.width() - metaW - 4, 2);
+  M5.Display.print(meta);
+
+  M5.Display.setCursor(4, 2 + lh);
+  if (state == RunState::Error && detailLine.length()) {
+    printFitted(detailLine.c_str(), M5.Display.width() - 8);
+  } else if (userLine.length()) {
+    M5.Display.print(">");
+    printFitted(userLine.c_str(), M5.Display.width() - 16);
+  }
+
+  int y0 = answerOriginY();
+  int visible = answerVisible();
+  int maxW = M5.Display.width() - 12;
+  for (int i = 0; i < visible; i++) {
+    int row = answerScroll + i;
+    if (row >= answerRowsN) break;
+    M5.Display.setCursor(4, y0 + i * lh);
+    printFitted(answerRows[row], maxW);
+  }
+  if (answerRowsN > visible && answerScroll + visible < answerRowsN) {
+    int y = M5.Display.height() - 6;
+    int x = M5.Display.width() - 8;
+    M5.Display.fillTriangle(x, y, x + 6, y, x + 3, y + 5, 0xFD20);
+  }
   uiDirty = false;
 }
 
@@ -733,6 +858,8 @@ void setup() {
   M5.Display.setFont(&fonts::Font2);
   M5.Display.setTextSize(1);
   M5.Display.setBrightness(170);
+  M5.Display.setTextWrap(false);
+  M5.BtnB.setHoldThresh(700);
   speakerI2sLive = cfg.internal_spk || useSpk2;
   startSpeaker();
   M5.Mic.end();
@@ -768,7 +895,10 @@ void loop() {
     Serial.println("ptt upp");
     endPtt();
   }
-  if (M5.BtnB.wasPressed() && !pttHeld && state != RunState::Listen) toggleOutput();
+  if (!pttHeld && state != RunState::Listen) {
+    if (M5.BtnB.wasReleaseFor(700)) toggleOutput();
+    else if (M5.BtnB.wasClicked()) scrollAnswer();
+  }
 
   if (pttHeld) serviceCapture();
   servicePlayback();
