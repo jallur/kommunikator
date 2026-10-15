@@ -15,6 +15,39 @@ from .tokens import bearer_from_header, token_allowed
 from .xai import WebsocketsXaiFactory, XaiFactory
 
 log = logging.getLogger("kommunikator")
+access_log = logging.getLogger("kommunikator.access")
+
+
+class AccessLogMiddleware:
+    """Log path and status only. Never the query string or headers."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        kind = scope.get("type")
+        if kind not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path") or "/"
+        status: int | None = None
+
+        async def send_and_note(message):
+            nonlocal status
+            message_type = message.get("type")
+            if message_type == "http.response.start":
+                status = int(message["status"])
+            elif message_type == "websocket.close":
+                status = int(message.get("code") or 1000)
+            elif message_type == "websocket.accept" and status is None:
+                status = 101
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_and_note)
+        finally:
+            if status is not None:
+                access_log.info("%s %s", path, status)
 
 
 def create_app(
@@ -26,6 +59,7 @@ def create_app(
     memory = ConversationMemory()
     missions = GrokBotWebhookDispatcher(cfg.grok_bot_webhook_url)
     app = FastAPI(title="kommunikator-relay", docs_url=None, redoc_url=None)
+    app.add_middleware(AccessLogMiddleware)
     app.state.settings = cfg
     app.state.xai_factory = factory
     app.state.memory = memory
@@ -38,7 +72,6 @@ def create_app(
     @app.websocket("/ws")
     async def session(socket: WebSocket) -> None:
         await socket.accept()
-        # Query ?token= is not accepted. Uvicorn logs the request URL.
         token = bearer_from_header(socket.headers.get("authorization"))
         if not token_allowed(token, cfg.device_tokens):
             await socket.send_json(
