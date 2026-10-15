@@ -13,6 +13,7 @@
 #include <WiFiClientSecure.h>
 #include <nvs.h>
 #include <esp_sleep.h>
+#include <driver/i2s.h>
 #include <driver/rtc_io.h>
 
 #include <cstring>
@@ -57,6 +58,9 @@ static bool useSpk2 = true;
 static bool sessionReady = false;
 static bool pttHeld = false;
 static bool wsStarted = false;
+static bool speakerI2sLive = false;
+static bool capQueued = false;
+static int16_t capBuf[CAPTURE_SAMPLES];
 static bool uiDirty = true;
 
 static String wifiSsid;
@@ -170,9 +174,18 @@ static size_t ringPullSamples(int16_t* dest, size_t maxSamples) {
   return got;
 }
 
-static bool startSpeaker() {
-  M5.Mic.end();
+static void releaseSpeaker() {
+  i2s_port_t port = M5.Speaker.config().i2s_port;
   M5.Speaker.end();
+  if (!speakerI2sLive) return;
+  i2s_driver_uninstall(port);
+  speakerI2sLive = false;
+}
+
+static bool startSpeaker() {
+  capQueued = false;
+  M5.Mic.end();
+  releaseSpeaker();
   auto cfg = M5.Speaker.config();
   if (useSpk2) {
     cfg.pin_data_out = PIN_I2S_DOUT;
@@ -196,6 +209,7 @@ static bool startSpeaker() {
   M5.Speaker.config(cfg);
   M5.Speaker.setVolume(200);
   bool ok = M5.Speaker.begin();
+  speakerI2sLive = ok;
   if (!ok && useSpk2) {
     useSpk2 = false;
     prefs.putBool("spk2", false);
@@ -205,7 +219,9 @@ static bool startSpeaker() {
 }
 
 static bool startMic() {
-  M5.Speaker.end();
+  capQueued = false;
+  releaseSpeaker();
+  M5.Mic.end();
   auto cfg = M5.Mic.config();
   cfg.pin_data_in = PIN_MIC_DATA;
   cfg.pin_ws = PIN_MIC_CLK;
@@ -216,6 +232,8 @@ static bool startMic() {
   cfg.i2s_port = I2S_NUM_0;
   cfg.over_sampling = 2;
   cfg.magnification = 16;
+  cfg.dma_buf_len = 128;
+  cfg.task_priority = 2;
   M5.Mic.config(cfg);
   return M5.Mic.begin();
 }
@@ -423,11 +441,10 @@ static void logWsEvent(WStype_t type, uint8_t* payload, size_t length) {
     Serial.printf("ws typ DISCONNECTED kod %u orsak %s\n", closeCode, closeReason);
     return;
   }
-  if (type == WStype_BIN || type == WStype_FRAGMENT_BIN_START) {
-    Serial.printf("ws typ %s %u\n", wsTypeName(type), (unsigned)length);
+  if (type == WStype_BIN || type == WStype_FRAGMENT_BIN_START || type == WStype_PING || type == WStype_PONG) {
     return;
   }
-  if (type == WStype_TEXT || type == WStype_ERROR || type == WStype_PING || type == WStype_PONG) {
+  if (type == WStype_TEXT || type == WStype_ERROR) {
     char buf[96];
     copyPrintable(buf, sizeof(buf), reinterpret_cast<const char*>(payload), length);
     if (deviceToken.length() > 0 && strstr(buf, deviceToken.c_str())) {
@@ -579,14 +596,15 @@ static void beginWifi() {
 static void beginPtt() {
   if (state == RunState::Provision || state == RunState::Wifi) return;
   pttHeld = true;
+  capQueued = false;
   ringClear();
   M5.Speaker.stop();
   if (useSpk2) {
-    M5.Speaker.end();
+    releaseSpeaker();
     chirp(false);
   } else {
     chirp(false);
-    M5.Speaker.end();
+    releaseSpeaker();
   }
   if (!startMic()) {
     detailLine = "mic";
@@ -605,6 +623,7 @@ static void beginPtt() {
 static void endPtt() {
   if (!pttHeld) return;
   pttHeld = false;
+  capQueued = false;
   M5.Mic.end();
   if (sessionReady) sendPtt("up");
   if (useSpk2) {
@@ -647,12 +666,15 @@ static void draw() {
 
 static void serviceCapture() {
   if (!pttHeld || !sessionReady) return;
-  int16_t samples[CAPTURE_SAMPLES];
-  if (!M5.Mic.record(samples, CAPTURE_SAMPLES, CAPTURE_HZ)) {
-    delay(5);
+  if (!capQueued) {
+    capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
     return;
   }
-  webSocket.sendBIN(reinterpret_cast<uint8_t*>(samples), sizeof(samples));
+  // record() returns as soon as the buffer is queued. Sending it then lets
+  // the mic task write into a dead stack frame and panics core 1.
+  if (M5.Mic.isRecording()) return;
+  webSocket.sendBIN(reinterpret_cast<uint8_t*>(capBuf), sizeof(capBuf));
+  capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
 }
 
 static void servicePlayback() {
@@ -711,6 +733,7 @@ void setup() {
   M5.Display.setFont(&fonts::Font2);
   M5.Display.setTextSize(1);
   M5.Display.setBrightness(170);
+  speakerI2sLive = cfg.internal_spk || useSpk2;
   startSpeaker();
   M5.Mic.end();
   markActivity();

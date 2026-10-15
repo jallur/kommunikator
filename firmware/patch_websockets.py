@@ -77,6 +77,10 @@ def _patch(path, marker, old, new, decl):
         handle.write(text)
 
 
+MIC_STACK_OLD = "size_t stack_size = 2048 + (_cfg.dma_buf_len * sizeof(uint16_t));"
+MIC_STACK_NEW = "size_t stack_size = 6144 + (_cfg.dma_buf_len * sizeof(uint16_t));"
+
+
 def patch_websockets(env, node):
     path = node.srcnode().get_abspath()
     name = path.replace("\\", "/")
@@ -85,7 +89,10 @@ def patch_websockets(env, node):
         _patch(path, "kommOnArm();", ARM_OLD, ARM_NEW, STATUS_DECL)
     elif name.endswith("/WebSockets.cpp"):
         _patch(path, "kommOnClose(", CLOSE_OLD, CLOSE_NEW, CLOSE_DECL)
+    elif name.endswith("/Mic_Class.cpp"):
+        _patch(path, MIC_STACK_NEW, MIC_STACK_OLD, MIC_STACK_NEW, "")
     return node
 
 
 env.AddBuildMiddleware(patch_websockets, "*WebSockets*.cpp")
+env.AddBuildMiddleware(patch_websockets, "*Mic_Class.cpp")
