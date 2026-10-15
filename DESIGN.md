@@ -99,7 +99,7 @@ Hat SPK2-sidan säger både "32 kHz till 192 kHz" i punktlistan och "8 kHz ~ 96 
 
 `GET /ws`, uppgraderas till WebSocket.
 
-Auth, i ordning: `Authorization: Bearer <enhetstoken>`, annars query `token`. Headern är den som firmware använder. Query finns för felsökning och kan hamna i access-loggar. Relayn loggar inte token eller API-nyckel. Jämförelsen är `hmac.compare_digest` mot hela listan. Tom lista avvisar alla.
+Auth är bara `Authorization: Bearer <enhetstoken>`. Query `token` accepteras inte: uvicorns access-logg skriver ut hela URL:en. Firmware sätter headern i varje handskakning och lägger aldrig token i sökvägen. Relayn loggar inte token eller API-nyckel. Jämförelsen är `hmac.compare_digest` mot hela listan. Tom lista avvisar alla.
 
 Efter accept:
 

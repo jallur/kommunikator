@@ -38,9 +38,8 @@ def create_app(
     @app.websocket("/ws")
     async def session(socket: WebSocket) -> None:
         await socket.accept()
+        # Query ?token= is not accepted. Uvicorn logs the request URL.
         token = bearer_from_header(socket.headers.get("authorization"))
-        if not token:
-            token = socket.query_params.get("token", "")
         if not token_allowed(token, cfg.device_tokens):
             await socket.send_json(
                 {

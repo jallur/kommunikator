@@ -31,12 +31,26 @@ def _collect(ws, limit: int = 12) -> list[dict]:
 def test_bad_token_never_opens_xai(settings) -> None:
     factory = FakeFactory()
     client = TestClient(create_app(settings, factory))
-    with client.websocket_connect("/ws?token=wrong") as ws:
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer wrong"},
+    ) as ws:
         body = ws.receive_json()
         assert body["code"] == "unauthorized"
         with pytest.raises(WebSocketDisconnect) as caught:
             ws.receive_json()
     assert caught.value.code == 1008
+    assert factory.links == []
+
+
+def test_query_token_is_ignored(settings) -> None:
+    factory = FakeFactory()
+    client = TestClient(create_app(settings, factory))
+    with client.websocket_connect("/ws?token=device-token-a") as ws:
+        body = ws.receive_json()
+        assert body["code"] == "unauthorized"
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
     assert factory.links == []
 
 
