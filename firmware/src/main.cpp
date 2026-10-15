@@ -364,9 +364,9 @@ static void startWebSocket() {
   webSocket.onEvent(onWs);
   webSocket.setReconnectInterval(3000);
   if (useTls) {
-    webSocket.beginSslWithCA(relayHost.c_str(), relayPort, "/v1/session", KOMM_CA_CERT);
+    webSocket.beginSslWithCA(relayHost.c_str(), relayPort, "/ws", KOMM_CA_CERT);
   } else {
-    webSocket.begin(relayHost.c_str(), relayPort, "/v1/session");
+    webSocket.begin(relayHost.c_str(), relayPort, "/ws");
   }
   wsStarted = true;
   state = RunState::Connecting;

@@ -4,7 +4,7 @@ Röst-AI på en M5StickC Plus2, med en relay framför xAI:s realtime-API (Grok V
 
 Arkitekturen, källorna och öppna frågor finns i [DESIGN.md](DESIGN.md).
 
-Relayn körs med Docker på en Mac Mini. cloud01 är reserven. Jonas arbetsdator är inte värd.
+Relayn körs med Docker på cloud01, i `/home/grok/kommunikator`, byggd från `./src`. Jonas arbetsdator är inte värd.
 
 ## Hårdvara
 
@@ -37,17 +37,18 @@ GPIO0 delas. Tal och lyssning turas om. Det är avsiktligt och följer PTT.
 
 ## Snabbstart, relay
 
-På Mac Minin (eller cloud01 om Minin inte är värden). Inte på Jonas arbetsdator:
+På cloud01, i `/home/grok/kommunikator`. Inte på Jonas arbetsdator. Proxyn och nätet `proxy` finns redan.
 
 ```bash
-cd relay
+cd /home/grok/kommunikator
 cp .env.example .env
 # fyll i XAI_API_KEY och DEVICE_TOKENS (en token per enhet, kommaseparerat)
+# PORT kan utelämnas. Standard är 8090, lyssning på 0.0.0.0.
 docker compose up -d --build
-curl -fsS localhost:8080/healthz
+curl -fsS https://trek.aldenback.com/health
 ```
 
-Sätt en reverse proxy med TLS framför port 8080, på namnet `trek.aldenback.com`. Enheten ansluter med `wss://trek.aldenback.com/v1/session`. Certet ska vara Let's Encrypt. Firmware litar på ISRG Root X1.
+`docker compose` bygger imagen från `./src`. Tjänsten heter `kommunikator-relay`, läser `.env` och har en healthcheck mot `/health`. Enheten ansluter med `wss://trek.aldenback.com/ws`. Certet ska vara Let's Encrypt. Firmware litar på ISRG Root X1.
 
 `POST /v1/missions` är ett senare gränssnitt mot Grok Bot. Den anropar inget och svarar 501. Se DESIGN.md.
 
@@ -70,7 +71,7 @@ Användning: knapp A inne medan du pratar, släpp när du är klar. Pip vid tryc
 ## Tester
 
 ```bash
-cd relay
+cd src
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 cd ../firmware

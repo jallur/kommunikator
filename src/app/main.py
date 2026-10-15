@@ -30,11 +30,12 @@ def create_app(
     app.state.xai_factory = factory
     app.state.memory = memory
 
+    @app.get("/health")
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.websocket("/v1/session")
+    @app.websocket("/ws")
     async def session(socket: WebSocket) -> None:
         await socket.accept()
         token = bearer_from_header(socket.headers.get("authorization"))

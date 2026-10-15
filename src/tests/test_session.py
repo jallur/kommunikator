@@ -31,7 +31,7 @@ def _collect(ws, limit: int = 12) -> list[dict]:
 def test_bad_token_never_opens_xai(settings) -> None:
     factory = FakeFactory()
     client = TestClient(create_app(settings, factory))
-    with client.websocket_connect("/v1/session?token=wrong") as ws:
+    with client.websocket_connect("/ws?token=wrong") as ws:
         body = ws.receive_json()
         assert body["code"] == "unauthorized"
         with pytest.raises(WebSocketDisconnect) as caught:
@@ -45,7 +45,7 @@ def test_header_token_streams_audio_and_text(settings) -> None:
     client = TestClient(create_app(settings, factory))
     pcm = (b"\x00\x01" * 160)
     with client.websocket_connect(
-        "/v1/session",
+        "/ws",
         headers={"Authorization": "Bearer device-token-a"},
     ) as ws:
         ws.send_json(HELLO)
@@ -77,7 +77,7 @@ def test_empty_ptt_does_not_commit(settings) -> None:
     factory = FakeFactory()
     client = TestClient(create_app(settings, factory))
     with client.websocket_connect(
-        "/v1/session",
+        "/ws",
         headers={"Authorization": "Bearer device-token-b"},
     ) as ws:
         ws.send_json(HELLO)
@@ -95,7 +95,7 @@ def test_missing_api_key_fails_closed(settings) -> None:
     factory = FakeFactory()
     client = TestClient(create_app(replace(settings, xai_api_key=""), factory))
     with client.websocket_connect(
-        "/v1/session",
+        "/ws",
         headers={"Authorization": "Bearer device-token-a"},
     ) as ws:
         ws.send_json(HELLO)

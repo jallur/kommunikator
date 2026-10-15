@@ -18,14 +18,14 @@ Hämtat mot docs.x.ai 2026-10-15. Endpoints som inte står i de sidorna finns in
 
 ```
 M5StickC Plus2                      relay                         xAI
-PTT, PDM, skärm, summer  WSS/TLS    FastAPI /v1/session    WSS    wss://api.x.ai/v1/realtime
+PTT, PDM, skärm, summer  WSS/TLS    FastAPI /ws            WSS    wss://api.x.ai/v1/realtime
 enhetstoken                         API-nyckel, tokenkoll          Bearer XAI_API_KEY
 PCM16 binärt                        resample, commit/cancel        session.update
 ```
 
 Enheten pratar bara med relayn. Relayn öppnar xAI-socketen och håller API-nyckeln. Ephemeral tokens är dokumenterade för webbläsare som kopplar direkt till xAI. Den vägen används inte, eftersom nyckeln då skulle behöva en väg ut till enheten.
 
-Relayn körs som Docker på en Mac Mini. Samma `relay/docker-compose.yml`. cloud01 är reserven om Minin inte är värden. Jonas arbetsdator är inte värd: den sover och är inte en server. Enheten ansluter till `wss://trek.aldenback.com/v1/session` (port 443). TLS termineras framför containern. Processen lyssnar på HTTP `:8080`. Firmware litar på ISRG Root X1, så certet ska vara Let's Encrypt eller en kedja som slutar där.
+Relayn körs som Docker på cloud01, i `/home/grok/kommunikator`. Imagen byggs från `./src`. Tjänsten i `docker-compose.yml` heter `kommunikator-relay` och sitter på det externa nätet `proxy`, med `env_file: .env`. Jonas arbetsdator är inte värd. Enheten ansluter till `wss://trek.aldenback.com/ws` (port 443). TLS termineras på proxyn. Processen lyssnar på `0.0.0.0:8090`. Porten styrs av `PORT` i `.env` och är 8090 om variabeln saknas. Firmware litar på ISRG Root X1, så certet ska vara Let's Encrypt eller en kedja som slutar där.
 
 ## xAI-session
 
@@ -97,7 +97,7 @@ Hat SPK2-sidan säger både "32 kHz till 192 kHz" i punktlistan och "8 kHz ~ 96 
 
 ## Enhetsprotokoll
 
-`GET /v1/session`, uppgraderas till WebSocket.
+`GET /ws`, uppgraderas till WebSocket.
 
 Auth, i ordning: `Authorization: Bearer <enhetstoken>`, annars query `token`. Headern är den som firmware använder. Query finns för felsökning och kan hamna i access-loggar. Relayn loggar inte token eller API-nyckel. Jämförelsen är `hmac.compare_digest` mot hela listan. Tom lista avvisar alla.
 
@@ -118,7 +118,7 @@ Efter accept:
 
 Användarens `updated`-händelse är kumulativ och kommer bara om transkriptionsmodellen är satt. Assistentens `response.output_audio_transcript.delta` är ett delta. `response.done` blir `idle`.
 
-`/healthz` svarar `{"status":"ok"}` utan token.
+`GET /health` svarar `{"status":"ok"}` utan token. `GET /healthz` är samma svar, kvar som alias.
 
 ## Skärm och lägen
 
@@ -162,7 +162,7 @@ Efter 20 s i `REDO` dimmas bakgrundsbelysningen (GPIO27 ägs av M5GFX). Efter 3 
 4. Formuleringen "null for manual text turns" kan läsas som att null bara gäller text. `input_audio_buffer.commit` säger uttryckligen att commit finns när turn detection-typen är null. Vi skickar `{"type": null}`. Bekräfta mot en riktig session.
 5. Röst: `eve` är exempelvärdet. Välj röst efter `GET /v1/tts/voices` om den ska låta mer som en dator.
 6. SPK2-takt 16 kHz mot den motstridiga M5-specen. PDM 16 kHz mot M5:s 44100-exempel.
-7. DNS för `trek.aldenback.com` mot Mac Minin (eller cloud01) och ett Let's Encrypt-cert på 443. Firmware har redan ISRG Root X1.
+7. `trek.aldenback.com` pekar på cloud01 och TLS sitter på proxyn. Firmware har redan ISRG Root X1. Bekräfta att proxyn skickar `/ws` och `/health` till `kommunikator-relay:8090`.
 8. Grok Bot-webhook: adress, auth, payload.
 9. Sessionen tar slut efter 120 minuter. Resumption täcker 30 minuters inaktivitet i relayns minne, inte en omstart av containern.
 10. Skärmtypsnitt med åäö. Nu vikt till a/o.
