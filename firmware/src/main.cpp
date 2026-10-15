@@ -1,5 +1,6 @@
 // Kommunikator firmware for M5StickC Plus2.
-// Push-to-talk on button A, PDM mic uplink, SPK2 playback, buzzer chirp.
+// Push-to-talk on button A, PDM mic uplink, onboard buzzer playback.
+// Hat SPK2 is optional and off until button B selects it.
 // The xAI API key never lives here. The device only knows a relay token.
 
 #include <M5Unified.h>
@@ -379,7 +380,7 @@ static void loadConfig() {
   deviceToken = prefs.getString("token", KOMM_DEVICE_TOKEN);
   relayPort = prefs.getUShort("port", KOMM_RELAY_PORT);
   useTls = prefs.getBool("tls", KOMM_USE_TLS != 0);
-  useSpk2 = prefs.getBool("spk2", true);
+  useSpk2 = prefs.getBool("spk2", false);
 #ifdef KOMM_WIFI_SSID
   if (wifiSsid.length() == 0) wifiSsid = KOMM_WIFI_SSID;
 #ifdef KOMM_WIFI_PASS

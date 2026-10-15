@@ -18,14 +18,14 @@ Hämtat mot docs.x.ai 2026-10-15. Endpoints som inte står i de sidorna finns in
 
 ```
 M5StickC Plus2                      relay                         xAI
-PTT, PDM, skärm, SPK2    WSS/TLS    FastAPI /v1/session    WSS    wss://api.x.ai/v1/realtime
+PTT, PDM, skärm, summer  WSS/TLS    FastAPI /v1/session    WSS    wss://api.x.ai/v1/realtime
 enhetstoken                         API-nyckel, tokenkoll          Bearer XAI_API_KEY
 PCM16 binärt                        resample, commit/cancel        session.update
 ```
 
 Enheten pratar bara med relayn. Relayn öppnar xAI-socketen och håller API-nyckeln. Ephemeral tokens är dokumenterade för webbläsare som kopplar direkt till xAI. Den vägen används inte, eftersom nyckeln då skulle behöva en väg ut till enheten.
 
-Placering av relayn (cloud01 eller NAS-docker) är öppen för CoreIT. Inget i den här leveransen ska köras på Jonas Mac. `relay/docker-compose.yml` är hela driftsättningen. TLS termineras framför containern. Processen lyssnar på HTTP `:8080`.
+Relayn körs som Docker på en Mac Mini. Samma `relay/docker-compose.yml`. cloud01 är reserven om Minin inte är värden. Jonas arbetsdator är inte värd: den sover och är inte en server. Den ursprungliga gränsen var just den maskinen, inte en Mini som står på. TLS termineras framför containern. Processen lyssnar på HTTP `:8080`.
 
 ## xAI-session
 
@@ -66,7 +66,7 @@ Upp: SPM1423 PDM → PCM16 mono 16 kHz → binär WebSocket-frame.
 
 Relayn resamplar till `XAI_INPUT_RATE` (default 16000). Lika takt är en kopia. Annars linjär interpolation, ett sample latens över chunk-gränsen, så att det inte klickar.
 
-Ned: xAI PCM16 vid `XAI_OUTPUT_RATE` (default 24000) → relayn resamplar till den takt enheten anmälde i `hello.playback_rate` (firmware: 16000) → binär frame → I2S till SPK2.
+Ned: xAI PCM16 vid `XAI_OUTPUT_RATE` (default 24000) → relayn resamplar till den takt enheten anmälde i `hello.playback_rate` (firmware: 16000) → binär frame → den inbyggda summern. Hat SPK2 är av tills knapp B väljer den.
 
 Båda takterna måste vara en dokumenterad PCM-takt. 11025 och andra gissningar avvisas.
 
@@ -87,7 +87,7 @@ SPM1423, från StickC-Plus2 pin map:
 
 GPIO0 är både mikrofonklocka och högtalarens LRCLK. M5:s egen mic-text säger att mikrofon och högtalare inte kan användas samtidigt. Kommunikatorn är därför halv-duplex, vilket stämmer med PTT: högtalaren stängs innan PDM startar, och tvärtom efter släpp.
 
-Summern (passiv, GPIO2) är reserv. Knapp B växlar och sparar valet. I SPK2-läge är chirpen LEDC på GPIO2, så den inte tar GPIO0 från mikrofonen. I summer-läge spelar M5Unified PCM via summer-läget på GPIO2. Det blir inte tal av hi-fi-klass. Transkriptet ligger kvar på skärmen.
+Första enheten har ingen Hat SPK2. Firmware startar därför i summer-läge (passiv summer, GPIO2). M5Unified spelar PCM den vägen. Det blir ett surrande tal, inte en högtalare, och transkriptet på skärmen är det läsbara svaret. Chirpen går samma väg. Knapp B växlar till SPK2 och sparar valet i NVS den dag hatten sätts på. I SPK2-läge tas chirpen med LEDC på GPIO2, så den inte stjäl GPIO0 från mikrofonen.
 
 Chirp vid tryck är ett stigande pip, vid släpp ett fallande. Det är en TOS-liknande signal, inte ett inspelat ljudeffekt-sample.
 
@@ -162,7 +162,7 @@ Efter 20 s i `REDO` dimmas bakgrundsbelysningen (GPIO27 ägs av M5GFX). Efter 3 
 4. Formuleringen "null for manual text turns" kan läsas som att null bara gäller text. `input_audio_buffer.commit` säger uttryckligen att commit finns när turn detection-typen är null. Vi skickar `{"type": null}`. Bekräfta mot en riktig session.
 5. Röst: `eve` är exempelvärdet. Välj röst efter `GET /v1/tts/voices` om den ska låta mer som en dator.
 6. SPK2-takt 16 kHz mot den motstridiga M5-specen. PDM 16 kHz mot M5:s 44100-exempel.
-7. Relay-värd, cert (om inte Let's Encrypt) och om den ska ligga på cloud01 eller NAS.
+7. TLS-värdnamn och cert mot Mac Minin (eller cloud01 om Minin inte används). Let's Encrypt-roten sitter redan i firmware.
 8. Grok Bot-webhook: adress, auth, payload.
 9. Sessionen tar slut efter 120 minuter. Resumption täcker 30 minuters inaktivitet i relayns minne, inte en omstart av containern.
 10. Skärmtypsnitt med åäö. Nu vikt till a/o.

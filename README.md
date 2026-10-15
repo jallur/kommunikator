@@ -1,10 +1,10 @@
 # Kommunikator
 
-Röst-AI på en M5StickC Plus2, med en relay framför xAI:s realtime-API (Grok Voice). Enheten har push-to-talk, transkript på skärmen och uppspelning via Hat SPK2. API-nyckeln ligger bara i relayn.
+Röst-AI på en M5StickC Plus2, med en relay framför xAI:s realtime-API (Grok Voice). Enheten har push-to-talk, transkript på skärmen och uppspelning i den inbyggda summern. Hat SPK2 är valfri och av från start. API-nyckeln ligger bara i relayn.
 
 Arkitekturen, källorna och öppna frågor finns i [DESIGN.md](DESIGN.md).
 
-Relayn ska köras som container på cloud01 eller en NAS. Den ska inte köras på Jonas Mac.
+Relayn körs med Docker på en Mac Mini. cloud01 är reserven. Jonas arbetsdator är inte värd.
 
 ## Hårdvara
 
@@ -13,8 +13,8 @@ Relayn ska köras som container på cloud01 eller en NAS. Den ska inte köras p�
 | M5StickC Plus2 | ESP32-PICO-V3-02, 8 MB flash, 2 MB PSRAM |
 | Skärm | 1.14" ST7789v2, 135×240 |
 | Mikrofon | SPM1423, PDM |
-| Summer | Passiv, ombord |
-| Hat SPK2 | MAX98357 I2S, 1 W |
+| Summer | Passiv, ombord. Standardutgång tills en Hat SPK2 sätts på |
+| Hat SPK2 | Valfri senare. MAX98357 I2S, 1 W. Knapp B slår på den |
 | Knappar | A PTT, B utgång/portal, C ström |
 
 Pinnar från [StickC-Plus2](https://docs.m5stack.com/en/core/StickC-Plus2) och M5:s SPK2-exempel:
@@ -37,7 +37,7 @@ GPIO0 delas. Tal och lyssning turas om. Det är avsiktligt och följer PTT.
 
 ## Snabbstart, relay
 
-På den maskin som ska köra containern, inte på en arbetsdator som bara ska flasha:
+På Mac Minin (eller cloud01 om Minin inte är värden). Inte på Jonas arbetsdator:
 
 ```bash
 cd relay
@@ -65,7 +65,7 @@ python -m platformio device monitor
 
 Wi-Fi kan också sättas på enheten: håll knapp B inne vid start, eller starta utan sparat nät. Anslut till AP `Kommunikator` och öppna `http://192.168.4.1`. Formuläret sparar nät, relay och token i NVS.
 
-Användning: knapp A inne medan du pratar, släpp när du är klar. Pip vid tryck och släpp. Knapp B växlar mellan SPK2 och summern. Efter tre minuter i vila släcker den skärmen och lättsover. Knapp A väcker.
+Användning: knapp A inne medan du pratar, släpp när du är klar. Pip vid tryck och släpp. Svaret spelas i summern och skrivs på skärmen. Knapp B växlar till Hat SPK2 när den finns. Efter tre minuter i vila släcker den skärmen och lättsover. Knapp A väcker.
 
 ## Tester
 
