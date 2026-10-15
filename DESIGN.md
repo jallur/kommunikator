@@ -50,6 +50,7 @@ Payload som relayn skickar:
 | `audio.*.transport` | `binary` | Rå PCM16 little-endian i binära frames. JSON-händelser (transkript, status) stannar text. |
 | `resumption.enabled` | `true` | `conversation.created.conversation.id` sparas i relayns minne, hashat per enhetstoken, och skickas som `conversation_id` vid återanslutning. Historiken faller efter 30 minuters inaktivitet. |
 | `audio.input.transcription.model` | `grok-transcribe` | Se TODO. Behövs enligt kompatibilitetsnoten för live-transkript av användaren. |
+| `audio.input.transcription.language_hint` | `sv` | Svenska saknas i Supported Languages. Hint skickas ändå. Okänd kod ska ignoreras; ett avvisat `session.update` kommer som error. |
 
 Push-to-talk:
 
@@ -156,7 +157,7 @@ Efter 20 s i `REDO` dimmas bakgrundsbelysningen (GPIO27 ägs av M5GFX). Efter 3 
 
 ## TODO
 
-1. Svenska (`sv` / `sv-SE`) finns inte i tabellen Supported Languages. `language_hint` med okänd kod ignoreras tyst. Relayn sätter därför ingen hint, bara svensk `instructions`. Bekräfta att talet faktiskt blir svenska, och om xAI senare lägger till `sv`.
+1. Svenska (`sv` / `sv-SE`) finns inte i tabellen Supported Languages. Relayn skickar ändå `audio.input.transcription.language_hint = "sv"` tillsammans med svensk `instructions`. Okänd kod ska ignoreras tyst. Om `session.update` svarar med error, ta bort hinten. Bekräfta att talet blir svenska.
 2. `audio.input.transcription.model = "grok-transcribe"` står i kompatibilitetsnoten, inte i session-tabellen. Om `session.update` felar på fältet, ta bort det. Då försvinner live-texten av användaren. Färdig användartext kommer ändå på `conversation.item.input_audio_transcription.completed`, men JSON-nyckeln för texten (`transcript` mot annat) är inte utskriven i den hämtade referensen. Relayn läser `transcript`, `delta` och `text`.
 3. Felhändelsens typnamn saknas i den renderade referensen (texten ligger direkt efter `response.done`: kod och meddelande, sessionen stannar oftast uppe). Relayn behandlar `type == "error"`. Bekräfta namnet.
 4. Formuleringen "null for manual text turns" kan läsas som att null bara gäller text. `input_audio_buffer.commit` säger uttryckligen att commit finns när turn detection-typen är null. Vi skickar `{"type": null}`. Bekräfta mot en riktig session.

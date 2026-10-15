@@ -44,8 +44,8 @@ def test_session_update_matches_documented_shape() -> None:
     assert session["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
     assert session["audio"]["output"]["transport"] == "binary"
     assert session["audio"]["input"]["transcription"]["model"] == "grok-transcribe"
+    assert session["audio"]["input"]["transcription"]["language_hint"] == "sv"
     blob = json.dumps(payload)
-    assert "language_hint" not in blob
     assert "secret-key" not in blob
     assert "svenska" in session["instructions"]
 

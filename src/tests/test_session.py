@@ -114,6 +114,37 @@ def test_header_token_streams_audio_and_text(settings) -> None:
     assert any(message.get("bytes") for message in messages)
 
 
+def test_downlink_audio_is_split_below_the_stick_limit(settings) -> None:
+    # 24 kHz in, 16 kHz out: 9000 samples become 6000 samples, 12000 bytes.
+    factory = FakeFactory(downlink_pcm=b"\x10\x00" * 9000)
+    client = TestClient(create_app(settings, factory))
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down"})
+        ws.send_bytes(b"\x00\x00" * 320)
+        ws.send_json({"type": "ptt", "state": "up"})
+        frames: list[bytes] = []
+        saw_idle = False
+        for _ in range(40):
+            message = ws.receive()
+            payload = message.get("bytes")
+            if payload:
+                frames.append(payload)
+            text = message.get("text")
+            if text and json.loads(text).get("state") == "idle":
+                saw_idle = True
+                break
+    assert saw_idle
+    assert len(frames) >= 4
+    assert sum(len(item) for item in frames) > 10000
+    assert all(0 < len(item) <= 3200 for item in frames)
+    assert all(len(item) % 2 == 0 for item in frames)
+
+
 def test_empty_ptt_does_not_commit(settings) -> None:
     factory = FakeFactory()
     client = TestClient(create_app(settings, factory))

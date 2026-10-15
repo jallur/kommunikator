@@ -39,9 +39,10 @@ def parse_hello(payload: dict) -> Hello:
 def build_session_update(settings: Settings) -> dict:
     """Session shape from the Speech to Speech guide, fetched 2026-10-15.
 
-    Swedish is not in the supported-language table. language_hint is omitted
-    on purpose: unrecognized codes are ignored. Swedish is requested only in
-    instructions. turn_detection.type is null so PTT can commit the buffer.
+    Swedish is not in the supported-language table. language_hint is still
+    "sv": an unknown code is documented as ignored, and a rejected
+    session.update comes back as an error event. turn_detection.type is null
+    so PTT can commit the buffer.
     """
     return {
         "type": "session.update",
@@ -55,7 +56,10 @@ def build_session_update(settings: Settings) -> dict:
                 "input": {
                     "format": {"type": "audio/pcm", "rate": settings.xai_input_rate},
                     "transport": "binary",
-                    "transcription": {"model": settings.transcription_model},
+                    "transcription": {
+                        "model": settings.transcription_model,
+                        "language_hint": "sv",
+                    },
                 },
                 "output": {
                     "format": {"type": "audio/pcm", "rate": settings.xai_output_rate},

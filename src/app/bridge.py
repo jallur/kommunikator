@@ -16,6 +16,11 @@ from .xai import XaiFactory, XaiLink, dumps, realtime_url
 
 log = logging.getLogger("kommunikator.bridge")
 
+# The stick's WebSocket library drops the TCP connection when one frame is
+# larger than 15 KiB, and that local close has no close code. Keep each
+# downlink frame well under that limit.
+_DEVICE_AUDIO_CHUNK = 3200
+
 
 class _Turn:
     def __init__(self) -> None:
@@ -55,8 +60,12 @@ async def bridge(
             await device.send_json(payload)
 
     async def send_bytes(payload: bytes) -> None:
+        if not payload:
+            return
         async with send_lock:
-            await device.send_bytes(payload)
+            view = memoryview(payload)
+            for start in range(0, len(view), _DEVICE_AUDIO_CHUNK):
+                await device.send_bytes(bytes(view[start : start + _DEVICE_AUDIO_CHUNK]))
 
     try:
         await link.send(dumps(build_session_update(settings)))
