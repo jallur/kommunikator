@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -41,6 +42,32 @@ def test_bad_token_never_opens_xai(settings) -> None:
             ws.receive_json()
     assert caught.value.code == 1008
     assert factory.links == []
+
+
+def test_ws_reject_logs_missing_or_mismatch_without_the_token(caplog, settings) -> None:
+    client = TestClient(create_app(settings, FakeFactory()))
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with client.websocket_connect("/ws") as ws:
+            assert ws.receive_json()["code"] == "unauthorized"
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+        with client.websocket_connect(
+            "/ws",
+            headers={"Authorization": "Bearer wrong-token"},
+        ) as ws:
+            assert ws.receive_json()["code"] == "unauthorized"
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "uvicorn.error"
+    ]
+    assert messages.count("ws reject missing") == 1
+    assert messages.count("ws reject mismatch") == 1
+    for message in messages:
+        assert "wrong-token" not in message
+        assert "device-token" not in message
 
 
 def test_query_token_is_ignored(settings) -> None:

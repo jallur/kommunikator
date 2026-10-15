@@ -16,6 +16,7 @@ from .xai import WebsocketsXaiFactory, XaiFactory
 
 log = logging.getLogger("kommunikator")
 access_log = logging.getLogger("kommunikator.access")
+relay_log = logging.getLogger("uvicorn.error")
 
 
 class AccessLogMiddleware:
@@ -74,6 +75,7 @@ def create_app(
         await socket.accept()
         token = bearer_from_header(socket.headers.get("authorization"))
         if not token_allowed(token, cfg.device_tokens):
+            relay_log.info("ws reject %s", "missing" if not token else "mismatch")
             await socket.send_json(
                 {
                     "type": "error",

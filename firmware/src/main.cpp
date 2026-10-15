@@ -36,19 +36,16 @@ static Preferences prefs;
 static WebServer portal(80);
 static DNSServer dns;
 static uint16_t lastHttp = 0;
-static unsigned long lastProbeMs = 0;
+static uint16_t closeCode = 0;
+static char closeReason[80];
+
+static void logWsEvent(WStype_t type, uint8_t* payload, size_t length);
 
 class KommSocket : public WebSocketsClient {
  protected:
   void runCbEvent(WStype_t type, uint8_t* payload, size_t length) override {
-    if (type == WStype_CONNECTED) {
-      lastHttp = _client.cCode;
-      Serial.printf("ws oppen http %u\n", lastHttp);
-    } else if (type == WStype_DISCONNECTED) {
-      unsigned kod = 0;
-      if (payload && length >= 2) kod = (unsigned)((payload[0] << 8) | payload[1]);
-      Serial.printf("ws stangd http %u kod %u\n", lastHttp, kod);
-    }
+    if (type == WStype_CONNECTED) lastHttp = _client.cCode;
+    logWsEvent(type, payload, length);
     WebSocketsClient::runCbEvent(type, payload, length);
   }
 };
@@ -389,15 +386,91 @@ static bool nvsString(nvs_handle_t handle, const char* key, String& out) {
   return true;
 }
 
-static void logLink() {
-  lastProbeMs = millis();
+static const char* wsTypeName(WStype_t type) {
+  switch (type) {
+    case WStype_ERROR: return "ERROR";
+    case WStype_DISCONNECTED: return "DISCONNECTED";
+    case WStype_CONNECTED: return "CONNECTED";
+    case WStype_TEXT: return "TEXT";
+    case WStype_BIN: return "BIN";
+    case WStype_FRAGMENT_TEXT_START: return "FRAG_TEXT";
+    case WStype_FRAGMENT_BIN_START: return "FRAG_BIN";
+    case WStype_FRAGMENT: return "FRAG";
+    case WStype_FRAGMENT_FIN: return "FRAG_FIN";
+    case WStype_PING: return "PING";
+    case WStype_PONG: return "PONG";
+  }
+  return "?";
+}
+
+static void copyPrintable(char* out, size_t outLen, const char* in, size_t inLen) {
+  size_t n = inLen;
+  if (n > outLen - 1) n = outLen - 1;
+  for (size_t i = 0; i < n; i++) {
+    char c = in ? in[i] : '.';
+    if (c == '\r' || c == '\n') c = ' ';
+    out[i] = (c >= 32 && c < 127) ? c : '.';
+  }
+  out[n] = 0;
+}
+
+static void logWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.printf("ws typ CONNECTED http %u\n", lastHttp);
+    return;
+  }
+  if (type == WStype_DISCONNECTED) {
+    Serial.printf("ws typ DISCONNECTED kod %u orsak %s\n", closeCode, closeReason);
+    return;
+  }
+  if (type == WStype_BIN || type == WStype_FRAGMENT_BIN_START) {
+    Serial.printf("ws typ %s %u\n", wsTypeName(type), (unsigned)length);
+    return;
+  }
+  if (type == WStype_TEXT || type == WStype_ERROR || type == WStype_PING || type == WStype_PONG) {
+    char buf[96];
+    copyPrintable(buf, sizeof(buf), reinterpret_cast<const char*>(payload), length);
+    if (deviceToken.length() > 0 && strstr(buf, deviceToken.c_str())) {
+      Serial.printf("ws typ %s <hemlig>\n", wsTypeName(type));
+      return;
+    }
+    Serial.printf("ws typ %s %s\n", wsTypeName(type), buf);
+    return;
+  }
+  Serial.printf("ws typ %s\n", wsTypeName(type));
+}
+
+extern "C" void kommOnStatus(const char* line) {
+  closeCode = 0;
+  closeReason[0] = 0;
+  char buf[96];
+  size_t n = 0;
+  if (line) {
+    while (line[n] && line[n] != '\r' && line[n] != '\n' && n + 1 < sizeof(buf)) n++;
+  }
+  copyPrintable(buf, sizeof(buf), line, n);
+  const char* space = strchr(buf, ' ');
+  if (space) lastHttp = (uint16_t)atoi(space + 1);
+  Serial.printf("ws rad %s\n", buf);
+}
+
+extern "C" void kommOnClose(unsigned code, const char* reason, size_t len) {
+  closeCode = (uint16_t)code;
+  copyPrintable(closeReason, sizeof(closeReason), reason, len);
+}
+
+extern "C" void kommOnArm() {
+  closeCode = 0;
+  closeReason[0] = 0;
+}
+
+static void logTls() {
   if (!useTls) {
     Serial.printf("tls av %s:%u\n", relayHost.c_str(), (unsigned)relayPort);
     return;
   }
   WiFiClientSecure probe;
   probe.setCACert(KOMM_CA_CERT);
-  probe.setTimeout(5);
   char errText[48];
   errText[0] = 0;
   if (!probe.connect(relayHost.c_str(), relayPort, 8000)) {
@@ -407,25 +480,6 @@ static void logLink() {
     return;
   }
   Serial.printf("tls ok %s:%u\n", relayHost.c_str(), (unsigned)relayPort);
-  probe.print(F("GET /ws HTTP/1.1\r\nHost: "));
-  probe.print(relayHost);
-  probe.printf(":%u\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n", (unsigned)relayPort);
-  probe.print(F("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nAuthorization: Bearer "));
-  probe.print(deviceToken);
-  probe.print(F("\r\n\r\n"));
-  char line[32];
-  size_t n = 0;
-  while (n + 1 < sizeof(line)) {
-    int c = probe.read();
-    if (c < 0 || c == '\n' || c == '\r') break;
-    line[n++] = (char)c;
-  }
-  line[n] = 0;
-  int http = 0;
-  const char* space = strchr(line, ' ');
-  if (space) http = atoi(space + 1);
-  lastHttp = (uint16_t)http;
-  Serial.printf("ws http %d\n", http);
   probe.stop();
 }
 
@@ -436,15 +490,16 @@ static void startWebSocket() {
     return;
   }
   Serial.printf("wifi %s rssi %d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  logLink();
-  snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s\r\n", deviceToken.c_str());
+  logTls();
+  // The library adds the trailing CRLF. One here would end the request early.
+  snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s", deviceToken.c_str());
   webSocket.setExtraHeaders(authHeader);
   webSocket.onEvent(onWs);
   webSocket.setReconnectInterval(3000);
   if (useTls) {
-    webSocket.beginSslWithCA(relayHost.c_str(), relayPort, "/ws", KOMM_CA_CERT);
+    webSocket.beginSslWithCA(relayHost.c_str(), relayPort, "/ws", KOMM_CA_CERT, "");
   } else {
-    webSocket.begin(relayHost.c_str(), relayPort, "/ws");
+    webSocket.begin(relayHost.c_str(), relayPort, "/ws", "");
   }
   wsStarted = true;
   setState(RunState::Connecting);
@@ -679,7 +734,6 @@ void loop() {
   if (state == RunState::Wifi) {
     if (WiFi.status() == WL_CONNECTED) startWebSocket();
   } else if (wsStarted) {
-    if (!webSocket.isConnected() && millis() - lastProbeMs > 3000) logLink();
     webSocket.loop();
   }
 
