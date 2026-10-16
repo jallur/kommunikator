@@ -76,9 +76,10 @@ static uint32_t micSent = 0;
 static uint32_t micQuietMs = 0;
 static uint32_t micDrop = 0;
 static bool micRestarted = false;
-// One second of 16 kHz, so a slow socket write cannot stall the DMA.
-static constexpr size_t kMicRing = 16000;
-static int16_t micRing[kMicRing];
+// One second of 16 kHz lives in PSRAM. A static buffer of that size sits in
+// internal RAM and Bluetooth then fails esp_timer_create with ESP_ERR_NO_MEM.
+static int16_t* micRing = nullptr;
+static size_t micRingN = 0;
 static volatile size_t micW = 0;
 static volatile size_t micR = 0;
 static portMUX_TYPE micMux = portMUX_INITIALIZER_UNLOCKED;
@@ -564,35 +565,56 @@ static bool startSpeaker() {
   return ok;
 }
 
+static inline void micBarrier() { __asm__ __volatile__("memw" ::: "memory"); }
+
+static bool allocMicRing() {
+  if (micRing != nullptr) return true;
+  constexpr size_t kSamples = 16000;
+  micRing = static_cast<int16_t*>(
+      heap_caps_malloc(kSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (micRing == nullptr) {
+    Serial.println("mic ring saknas");
+    return false;
+  }
+  micRingN = kSamples;
+  Serial.printf("mic ring %u psram\n", static_cast<unsigned>(micRingN));
+  return true;
+}
+
 static void micResetRing() {
-  portENTER_CRITICAL(&micMux);
   micW = 0;
   micR = 0;
-  portEXIT_CRITICAL(&micMux);
+  micBarrier();
 }
 
 static void micPush(const int16_t* src, size_t n) {
-  portENTER_CRITICAL(&micMux);
+  if (micRing == nullptr || micRingN < 2) return;
+  size_t w = micW;
   for (size_t i = 0; i < n; i++) {
-    size_t next = (micW + 1) % kMicRing;
+    size_t next = (w + 1) % micRingN;
     if (next == micR) {
-      micR = (micR + 1) % kMicRing;
-      micDrop++;
+      micDrop += static_cast<uint32_t>(n - i);
+      return;
     }
-    micRing[micW] = src[i];
-    micW = next;
+    micRing[w] = src[i];
+    micBarrier();
+    w = next;
+    micW = w;
   }
-  portEXIT_CRITICAL(&micMux);
 }
 
 static size_t micPop(int16_t* dst, size_t maxn) {
-  portENTER_CRITICAL(&micMux);
+  if (micRing == nullptr || micRingN < 2) return 0;
   size_t n = 0;
-  while (n < maxn && micR != micW) {
-    dst[n++] = micRing[micR];
-    micR = (micR + 1) % kMicRing;
+  size_t r = micR;
+  size_t w = micW;
+  micBarrier();
+  while (n < maxn && r != w) {
+    dst[n++] = micRing[r];
+    r = (r + 1) % micRingN;
   }
-  portEXIT_CRITICAL(&micMux);
+  micBarrier();
+  micR = r;
   return n;
 }
 
@@ -621,13 +643,15 @@ static void micReader(void*) {
 
 static void startMicTask() {
   if (micTaskHandle != nullptr) return;
-  if (xTaskCreatePinnedToCore(micReader, "mic", 4096, nullptr, 4, &micTaskHandle, 1) != pdPASS) {
+  if (!allocMicRing()) return;
+  if (xTaskCreatePinnedToCore(micReader, "mic", 3072, nullptr, 4, &micTaskHandle, 1) != pdPASS) {
     micTaskHandle = nullptr;
     Serial.println("mic task nej");
     return;
   }
   micTaskOn = true;
-  Serial.println("mic task");
+  Serial.printf("mic task intern %u\n",
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 }
 
 static void stopMic() {
