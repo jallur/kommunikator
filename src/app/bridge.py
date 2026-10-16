@@ -31,6 +31,9 @@ _DEVICE_AUDIO_CHUNK = 3200
 
 class _Turn:
     def __init__(self) -> None:
+        self.id = 0
+        # None means "do not play". 0 is a real turn for a client that omits the field.
+        self.playing_id: int | None = None
         self.capturing = False
         self.sent_audio = False
         self.response_active = False
@@ -39,6 +42,19 @@ class _Turn:
         self.user_transcript = ""
         self.transcript_ready = asyncio.Event()
         self.reply_task: asyncio.Task[None] | None = None
+
+
+def _turn_id(payload: dict) -> int:
+    raw = payload.get("turn", 0)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
+
+
+def _stamp(message: dict, turn_id: int) -> dict:
+    stamped = dict(message)
+    stamped["turn"] = turn_id
+    return stamped
 
 
 async def bridge(
@@ -65,6 +81,7 @@ async def bridge(
         settings.xai_api_key,
     )
     send_lock = asyncio.Lock()
+    xai_lock = asyncio.Lock()
 
     async def send_json(payload: dict) -> None:
         async with send_lock:
@@ -79,7 +96,8 @@ async def bridge(
                 await device.send_bytes(bytes(view[start : start + _DEVICE_AUDIO_CHUNK]))
 
     try:
-        await link.send(dumps(build_session_update(settings, hello.playback_rate)))
+        async with xai_lock:
+            await link.send(dumps(build_session_update(settings, hello.playback_rate)))
         conversation_id = await _wait_session_updated(link, token, memory)
         await send_json(
             {
@@ -94,8 +112,10 @@ async def bridge(
         downlink = Pcm16Resampler(hello.playback_rate, hello.playback_rate)
         turn = _Turn()
         async with asyncio.TaskGroup() as group:
-            group.create_task(_device_to_xai(device, link, uplink, turn, send_json, settings))
-            group.create_task(_xai_to_device(link, downlink, turn, send_json, send_bytes))
+            group.create_task(
+                _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lock)
+            )
+            group.create_task(_xai_to_device(link, downlink, turn, send_json, send_bytes, xai_lock))
     except ExceptionGroup as group:
         if not _expected_disconnect(group):
             log.warning("session ended: %s", type(group.exceptions[0]).__name__)
@@ -142,21 +162,26 @@ async def _wait_session_updated(link: XaiLink, token: str, memory: ConversationM
             raise ConnectionError("xAI session.update failed")
 
 
-async def _answer_after_transcript(link, settings, turn) -> None:
+async def _answer_after_transcript(link, settings, turn, xai_lock, turn_id: int) -> None:
     try:
         await asyncio.wait_for(turn.transcript_ready.wait(), timeout=2.5)
     except TimeoutError:
         log.info("user transcript missing, answering the audio alone")
-    if not turn.reply_pending:
-        return
-    turn.reply_pending = False
-    quote = turn.user_transcript.strip()
+    quote = ""
+    async with xai_lock:
+        # Same lock as clear/cancel. A late response.create must not land
+        # after the next turn has wiped the buffer.
+        if not turn.reply_pending or turn.id != turn_id:
+            return
+        turn.reply_pending = False
+        turn.playing_id = turn_id
+        quote = turn.user_transcript.strip()
+        await link.send(dumps(build_response_create(settings, quote)))
     if quote:
         log.info("response follows transcript (%d chars)", len(quote))
-    await link.send(dumps(build_response_create(settings, quote)))
 
 
-async def _device_to_xai(device, link, uplink, turn, send_json, settings) -> None:
+async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lock) -> None:
     try:
         while True:
             try:
@@ -170,8 +195,10 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings) -> Non
                 if turn.capturing:
                     pcm = uplink.process(data)
                     if pcm:
-                        await link.send(pcm)
-                        turn.sent_audio = True
+                        async with xai_lock:
+                            if turn.capturing:
+                                await link.send(pcm)
+                                turn.sent_audio = True
                 continue
             text = incoming.get("text")
             if not text:
@@ -181,45 +208,65 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings) -> Non
             if kind == "ping":
                 await send_json({"type": "pong"})
             elif kind == "ptt" and payload.get("state") == "down":
-                turn.reply_pending = False
-                if turn.reply_task is not None and not turn.reply_task.done():
-                    turn.reply_task.cancel()
+                turn_id = _turn_id(payload)
                 turn.capturing = True
                 turn.sent_audio = False
                 turn.user_transcript = ""
                 turn.transcript_ready.clear()
-                if turn.response_active:
-                    await link.send(dumps({"type": "response.cancel"}))
-                    turn.response_active = False
-                await link.send(dumps({"type": "input_audio_buffer.clear"}))
+                async with xai_lock:
+                    turn.reply_pending = False
+                    turn.id = turn_id
+                    turn.playing_id = None
+                    turn.announced_speaking = False
+                    if turn.response_active:
+                        await link.send(dumps({"type": "response.cancel"}))
+                        turn.response_active = False
+                    await link.send(dumps({"type": "input_audio_buffer.clear"}))
+                if turn.reply_task is not None and not turn.reply_task.done():
+                    turn.reply_task.cancel()
             elif kind == "ptt" and payload.get("state") == "up":
+                up_id = _turn_id(payload)
+                if up_id != turn.id:
+                    log.info("ptt up ignored for turn %s, current is %s", up_id, turn.id)
+                    continue
                 turn.capturing = False
-                if turn.sent_audio:
-                    turn.reply_pending = True
-                    turn.user_transcript = ""
-                    turn.transcript_ready.clear()
+                if not turn.sent_audio:
+                    continue
+                turn.user_transcript = ""
+                turn.transcript_ready.clear()
+                async with xai_lock:
+                    if turn.id != up_id or not turn.sent_audio:
+                        continue
                     await link.send(dumps({"type": "input_audio_buffer.commit"}))
-                    turn.reply_task = asyncio.create_task(
-                        _answer_after_transcript(link, settings, turn)
-                    )
+                    turn.reply_pending = True
                     turn.sent_audio = False
+                turn.reply_task = asyncio.create_task(
+                    _answer_after_transcript(link, settings, turn, xai_lock, up_id)
+                )
     finally:
         turn.reply_pending = False
         if turn.reply_task is not None and not turn.reply_task.done():
             turn.reply_task.cancel()
 
 
-async def _xai_to_device(link, downlink, turn, send_json, send_bytes) -> None:
+async def _xai_to_device(link, downlink, turn, send_json, send_bytes, xai_lock) -> None:
     while True:
         raw = await link.recv()
         if isinstance(raw, bytes):
+            async with xai_lock:
+                play = turn.playing_id
+            if play is None:
+                continue
             pcm = downlink.process(raw)
-            if pcm:
-                await send_bytes(pcm)
+            if not pcm:
+                continue
+            # The stick drops binary until a speaking status for this turn
+            # has been seen. The status has to be the previous frame.
             if not turn.announced_speaking:
                 turn.announced_speaking = True
                 turn.response_active = True
-                await send_json({"type": "status", "state": "speaking"})
+                await send_json({"type": "status", "state": "speaking", "turn": play})
+            await send_bytes(pcm)
             continue
         event = json.loads(raw)
         heard = user_transcript(event)
@@ -229,16 +276,26 @@ async def _xai_to_device(link, downlink, turn, send_json, send_bytes) -> None:
                 turn.user_transcript = text
             if final:
                 turn.transcript_ready.set()
-        if event.get("type") == "response.created":
+        kind = event.get("type")
+        if kind == "response.created":
             turn.response_active = True
             turn.announced_speaking = False
-        elif event.get("type") == "response.done":
+        elif kind == "response.done":
             turn.response_active = False
-            turn.announced_speaking = False
-        elif event.get("type") == "conversation.created":
+        elif kind == "conversation.created":
             continue
+        async with xai_lock:
+            play = turn.playing_id
+            label = turn.id if play is None else play
         for message in map_server_event(event):
-            await send_json(message)
+            if message.get("type") == "status" and play is None:
+                continue
+            await send_json(_stamp(message, label))
+        if kind == "response.done":
+            async with xai_lock:
+                if turn.playing_id == play:
+                    turn.playing_id = None
+                    turn.announced_speaking = False
 
 
 def _expected_disconnect(group: ExceptionGroup) -> bool:

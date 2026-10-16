@@ -165,6 +165,64 @@ def test_downlink_audio_is_split_below_the_stick_limit(settings) -> None:
     assert all(len(item) % 2 == 0 for item in frames)
 
 
+def test_turn_is_echoed_and_speaking_precedes_audio(settings) -> None:
+    factory = FakeFactory()
+    client = TestClient(create_app(settings, factory))
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down", "turn": 7})
+        ws.send_bytes(b"\x00\x01" * 160)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 7})
+        ordered: list[dict] = []
+        for _ in range(12):
+            message = ws.receive()
+            ordered.append(message)
+            text = message.get("text")
+            if text and json.loads(text).get("state") == "idle":
+                break
+    states = []
+    saw_audio = False
+    speaking_before_audio = False
+    for message in ordered:
+        text = message.get("text")
+        if message.get("bytes"):
+            saw_audio = True
+        if not text:
+            continue
+        body = json.loads(text)
+        if body.get("type") != "status":
+            continue
+        assert body["turn"] == 7
+        states.append(body["state"])
+        if body["state"] == "speaking" and not saw_audio:
+            speaking_before_audio = True
+    assert states == ["thinking", "speaking", "idle"]
+    assert speaking_before_audio
+    assert saw_audio
+
+
+def test_ptt_up_for_another_turn_does_not_commit(settings) -> None:
+    factory = FakeFactory()
+    client = TestClient(create_app(settings, factory))
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down", "turn": 7})
+        ws.send_bytes(b"\x00\x01" * 160)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 8})
+
+    texts = [json.loads(item) for item in factory.links[0].sent if isinstance(item, str)]
+    assert not any(item.get("type") == "input_audio_buffer.commit" for item in texts)
+    assert not any(item.get("type") == "response.create" for item in texts)
+
+
 def test_empty_ptt_does_not_commit(settings) -> None:
     factory = FakeFactory()
     client = TestClient(create_app(settings, factory))

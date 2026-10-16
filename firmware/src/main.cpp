@@ -16,19 +16,21 @@
 #include <driver/i2s.h>
 #include <driver/rtc_io.h>
 #include <esp_heap_caps.h>
-#include <esp_a2dp_api.h>
 #include <esp_coexist.h>
 #include <mbedtls/platform.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 
+#include "config.h"
+
+#if KOMM_A2DP
+#include <esp_a2dp_api.h>
 #include <BluetoothA2DPSource.h>
+#endif
 
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
-
-#include "config.h"
 
 enum class RunState : uint8_t {
   Boot,
@@ -63,9 +65,15 @@ class KommSocket : public WebSocketsClient {
 static KommSocket webSocket;
 
 static RunState state = RunState::Boot;
+#if KOMM_A2DP
 static bool useSpk2 = true;
+#else
+static bool useSpk2 = false;
+#endif
 static bool sessionReady = false;
 static volatile bool pttHeld = false;
+static uint32_t turnId = 0;
+static bool hearTurn = false;
 static bool wsStarted = false;
 static bool speakerI2sLive = false;
 static bool capQueued = false;
@@ -74,6 +82,7 @@ static bool micOpen = false;
 static size_t capFill = 0;
 static uint32_t micSent = 0;
 static uint32_t micQuietMs = 0;
+static uint32_t micChunkMs = 0;
 static uint32_t micDrop = 0;
 static bool micRestarted = false;
 // One second of 16 kHz lives in PSRAM. A static buffer of that size sits in
@@ -143,7 +152,9 @@ static uint8_t screenBright = 170;
 static bool setupOpen = false;
 static bool swallowPwrClick = false;
 static int setupSel = 0;
-static uint32_t playClock = 48000;
+// Plus2's buzzer is a 1-bit modulator and wants a fast I2S clock.
+// S3 boards play the PCM rate the profile asked the relay for.
+static uint32_t playClock = KOMM_A2DP ? 48000u : PLAYBACK_HZ;
 static uint8_t buzzerMag = 48;
 static uint8_t spk2Mag = 16;
 static portMUX_TYPE audioMux = portMUX_INITIALIZER_UNLOCKED;
@@ -294,9 +305,9 @@ static size_t ringPullSamples(int16_t* dest, size_t maxSamples) {
   return got;
 }
 
-// AirPods Pro 1 speak classic A2DP (SBC). The stick is the source. The mic
-// stays on the stick. While the buds are connected the buzzer is quiet and
-// this callback turns the 16 kHz reply into 44.1 kHz stereo.
+// AirPods Pro 1 speak classic A2DP (SBC). Only the Plus2 profile has that
+// radio. StickS3 and CoreS3 Lite play on their own speaker.
+#if KOMM_A2DP
 static BluetoothA2DPSource a2dp;
 static volatile int a2dpState = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
 static int appliedA2dp = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
@@ -309,9 +320,19 @@ static bool airpodsOn() {
 static bool a2dpMediaOn = false;
 static bool a2dpMediaWant = false;
 static unsigned long a2dpCmdMs = 0;
+#else
+static int a2dpState = 0;
+static int appliedA2dp = 0;
+static char a2dpName[48] = "";
+static bool airpodsOn() { return false; }
+static bool a2dpMediaOn = false;
+static bool a2dpMediaWant = false;
+static unsigned long a2dpCmdMs = 0;
+#endif
 static IPAddress relayIp;
 static bool relayIpOk = false;
 
+#if KOMM_A2DP
 static void onA2dpAudio(esp_a2d_audio_state_t audio, void*) {
   a2dpMediaOn = audio == ESP_A2D_AUDIO_STATE_STARTED;
   Serial.printf("bt ljud %d\n", static_cast<int>(audio));
@@ -340,6 +361,9 @@ static void setAirpodMedia(bool run) {
   Serial.printf("bt media %s %d on %d\n", run ? "start" : "paus", static_cast<int>(err),
                 a2dpMediaOn ? 1 : 0);
 }
+#else
+static void setAirpodMedia(bool) {}
+#endif
 
 static void cacheRelayIp(const char* host) {
   if (relayIpOk || host == nullptr || host[0] == '\0') return;
@@ -357,6 +381,7 @@ static uint8_t avrcpVolume() {
   return static_cast<uint8_t>((static_cast<uint16_t>(playVolume) * 127) / 255);
 }
 
+#if KOMM_A2DP
 static bool containsAirpod(const char* name) {
   if (name == nullptr) return false;
   char buf[48];
@@ -386,6 +411,7 @@ static void onA2dpConn(esp_a2d_connection_state_t state, void*) {
   uiDirty = true;
   Serial.printf("bt lage %d\n", a2dpState);
 }
+#endif
 
 static size_t stereoAvailFrames() {
   portENTER_CRITICAL(&stMux);
@@ -425,6 +451,7 @@ static void stereoFromPcm(const uint8_t* data, size_t len) {
   portEXIT_CRITICAL(&stMux);
 }
 
+#if KOMM_A2DP
 static int32_t fillAirpods(Frame* frame, int32_t count) {
   static bool primed = false;
   constexpr size_t kPrimeFrames = 26460;
@@ -462,6 +489,7 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
   else fillOutFrames += static_cast<uint32_t>(n);
   return static_cast<int32_t>(n);
 }
+#endif
 
 static void logAudio(const char* why) {
   unsigned age = lastAudioMs == 0 ? 0u : static_cast<unsigned>(millis() - lastAudioMs);
@@ -478,6 +506,7 @@ static void logAudio(const char* why) {
 static void releaseSpeaker();
 static bool startSpeaker();
 
+#if KOMM_A2DP
 static void startAirpods() {
   Serial.println("bt start, satt AirPods i parning");
   a2dp.set_local_name("Kommunikator");
@@ -512,6 +541,12 @@ static void serviceAirpods() {
     if (!pttHeld) startSpeaker();
   }
 }
+#else
+static void startAirpods() {
+  Serial.printf("kort %s utan a2dp\n", kBoard.deviceId);
+}
+static void serviceAirpods() {}
+#endif
 
 static void releaseSpeaker() {
   i2s_port_t port = M5.Speaker.config().i2s_port;
@@ -526,6 +561,7 @@ static bool startSpeaker() {
   M5.Mic.end();
   releaseSpeaker();
   auto cfg = M5.Speaker.config();
+#if KOMM_A2DP
   if (useSpk2) {
     cfg.pin_data_out = PIN_I2S_DOUT;
     cfg.pin_bck = PIN_I2S_BCLK;
@@ -543,6 +579,7 @@ static bool startSpeaker() {
     cfg.i2s_port = I2S_NUM_1;
     cfg.magnification = buzzerMag;
   }
+#endif
   cfg.stereo = false;
   // The buzzer is a 1-bit modulator. Its I2S clock has to stay fast or the
   // bitstream collapses into noise. playRaw still hands over 16 kHz PCM.
@@ -634,7 +671,14 @@ static void micReader(void*) {
       continue;
     }
     size_t got = 0;
+#if KOMM_A2DP
     i2s_read(I2S_NUM_0, tmp, sizeof(tmp), &got, pdMS_TO_TICKS(10));
+#else
+    if (M5.Mic.record(tmp, 64, CAPTURE_HZ, false)) {
+      for (int i = 0; i < 30 && M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
+      if (!M5.Mic.isRecording()) got = sizeof(tmp);
+    }
+#endif
     if (got >= sizeof(int16_t)) micPush(tmp, got / sizeof(int16_t));
     micInRead = false;
     if (got < sizeof(int16_t)) vTaskDelay(pdMS_TO_TICKS(5));
@@ -662,15 +706,37 @@ static void stopMic() {
   capQueued = false;
   capLive = false;
   if (!micOpen) return;
+#if KOMM_A2DP
   i2s_stop(I2S_NUM_0);
   micWaitIdle();
   i2s_driver_uninstall(I2S_NUM_0);
+#else
+  micWaitIdle();
+  M5.Mic.end();
+#endif
   micOpen = false;
+}
+
+static void armMic(const char* how) {
+  micResetRing();
+  micOpen = true;
+  micSent = 0;
+  micDrop = 0;
+  micQuietMs = millis();
+  micChunkMs = millis();
+  micRestarted = false;
+  portENTER_CRITICAL(&micMux);
+  micRun = true;
+  portEXIT_CRITICAL(&micMux);
+  if (micTaskHandle != nullptr) xTaskNotifyGive(micTaskHandle);
+  Serial.printf("mic %s intern %u\n", how,
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 }
 
 static bool startMic() {
   stopMic();
   releaseSpeaker();
+#if KOMM_A2DP
   M5.Mic.end();
   // SPM1423 is PDM, and this ESP32 only has PDM on I2S0. A short DMA
   // queue overflows while the main loop draws or writes TLS, and the
@@ -710,19 +776,17 @@ static bool startMic() {
     return false;
   }
   i2s_start(I2S_NUM_0);
-  micResetRing();
-  micOpen = true;
-  micSent = 0;
-  micDrop = 0;
-  micQuietMs = millis();
-  micRestarted = false;
-  portENTER_CRITICAL(&micMux);
-  micRun = true;
-  portEXIT_CRITICAL(&micMux);
-  if (micTaskHandle != nullptr) xTaskNotifyGive(micTaskHandle);
-  Serial.printf("mic igang intern %u\n",
-                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+  armMic("igang");
   return true;
+#else
+  M5.Mic.end();
+  if (!M5.Mic.begin()) {
+    Serial.println("mic begin nej");
+    return false;
+  }
+  armMic("m5");
+  return true;
+#endif
 }
 
 static bool wsCanSend();
@@ -801,16 +865,18 @@ static void sendHello() {
   doc["capture_rate"] = CAPTURE_HZ;
   doc["playback_rate"] = PLAYBACK_HZ;
   doc["format"] = "pcm16le";
-  doc["device_id"] = "stickc-plus2";
+  doc["device_id"] = kBoard.deviceId;
   sendJson(doc);
-  Serial.printf("hello spel %u\n", static_cast<unsigned>(PLAYBACK_HZ));
+  Serial.printf("hello %s spel %u\n", kBoard.deviceId, static_cast<unsigned>(PLAYBACK_HZ));
 }
 
 static void sendPtt(const char* edge) {
   JsonDocument doc;
   doc["type"] = "ptt";
   doc["state"] = edge;
+  doc["turn"] = turnId;
   sendJson(doc);
+  Serial.printf("ptt %s turn %u\n", edge, static_cast<unsigned>(turnId));
 }
 
 static const int kAnswerRows = 48;
@@ -917,7 +983,11 @@ static void onTextMessage(const char* payload, size_t length) {
     return;
   }
   if (strcmp(type, "status") == 0) {
-    applyStatus(doc["state"] | "");
+    uint32_t turn = doc["turn"] | 0;
+    if (turn != turnId) return;
+    const char* name = doc["state"] | "";
+    if (strcmp(name, "speaking") == 0) hearTurn = true;
+    applyStatus(name);
     return;
   }
   if (strcmp(type, "transcript.user") == 0) {
@@ -974,14 +1044,15 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
       onTextMessage(reinterpret_cast<const char*>(payload), length);
       break;
     case WStype_BIN:
-      if (!pttHeld) {
+      if (!pttHeld && hearTurn) {
         ringPush(payload, length);
         setState(RunState::Speak);
         markActivity();
         Serial.printf("ljud in %u ", static_cast<unsigned>(length));
         logAudio("paket");
       } else {
-        Serial.printf("ljud slapp %u B under ptt\n", static_cast<unsigned>(length));
+        Serial.printf("ljud slapp %u B turn %u\n", static_cast<unsigned>(length),
+                      static_cast<unsigned>(turnId));
       }
       break;
     case WStype_ERROR:
@@ -1287,6 +1358,9 @@ static void beginPtt() {
   pttHeld = true;
   listenLive = true;
   listenSince = millis();
+  if (turnId == 0xffffffffu) turnId = 0;
+  turnId++;
+  hearTurn = false;
   capQueued = false;
   capLive = false;
   ringClear();
@@ -1357,7 +1431,9 @@ static void endPtt() {
     portENTER_CRITICAL(&micMux);
     micRun = false;
     portEXIT_CRITICAL(&micMux);
+#if KOMM_A2DP
     if (micOpen) i2s_stop(I2S_NUM_0);
+#endif
     micWaitIdle();
   }
   drainMic();
@@ -1394,7 +1470,9 @@ static void bumpVolume() {
   playVolume = static_cast<uint8_t>(next);
   prefs.putUChar("vol", playVolume);
   if (M5.Speaker.isRunning()) M5.Speaker.setVolume(playVolume);
+#if KOMM_A2DP
   a2dp.set_volume(avrcpVolume());
+#endif
 }
 
 static void bumpBright() {
@@ -1568,7 +1646,10 @@ static bool drainMic() {
         capFill = 0;
         capLive = true;
       }
-      int32_t sample = static_cast<int32_t>(tmp[i]) << 4;
+      int32_t sample = tmp[i];
+#if KOMM_A2DP
+      sample <<= 4;
+#endif
       if (sample > 32767) sample = 32767;
       if (sample < -32768) sample = -32768;
       capBuf[capFill++] = static_cast<int16_t>(sample);
@@ -1583,10 +1664,12 @@ static bool drainMic() {
 
 static void serviceCapture() {
   if (!pttHeld || !micOpen) return;
+#if KOMM_A2DP
   if ((GPIO.in1.data & (1UL << (GPIO_NUM_35 - 32))) == 0) {
     abortActivity();
     return;
   }
+#endif
   if (!sessionReady) {
     int16_t trash[64];
     for (int i = 0; i < 8; i++) {
@@ -1594,13 +1677,25 @@ static void serviceCapture() {
     }
     return;
   }
-  if (drainMic()) return;
-  if (micRestarted || millis() - micQuietMs < 50) return;
+  drainMic();
+  // A full 20 ms frame is best, but a short press or a stalled DMA queue
+  // used to sit under that and never leave the stick. The relay only asks
+  // Grok to answer after at least one binary frame.
+  if (capFill >= 2 && millis() - micChunkMs >= 100) {
+    if (sendCapture(capFill)) {
+      capFill = 0;
+      capLive = true;
+    }
+    micChunkMs = millis();
+  }
+#if KOMM_A2DP
+  if (capFill > 0 || micRestarted || millis() - micQuietMs < 200) return;
   i2s_stop(I2S_NUM_0);
   i2s_start(I2S_NUM_0);
   micRestarted = true;
   micQuietMs = millis();
   Serial.println("mic omstart");
+#endif
 }
 
 static void printAudio() {
@@ -1691,7 +1786,9 @@ static void handleAudioCmd(char* line) {
     }
     playVolume = static_cast<uint8_t>(volume);
     if (M5.Speaker.isRunning()) M5.Speaker.setVolume(playVolume);
+#if KOMM_A2DP
     a2dp.set_volume(avrcpVolume());
+#endif
     printAudio();
     return;
   }
@@ -1815,7 +1912,12 @@ static void maybeSleep() {
   unsigned long quiet = millis() - lastActivity;
   if (quiet > DIM_AFTER_MS) M5.Display.setBrightness(24);
   if (quiet < SLEEP_AFTER_MS) return;
+#if KOMM_A2DP
   if (a2dpState != ESP_A2D_CONNECTION_STATE_DISCONNECTED) return;
+#else
+  // Wake pin and power hold are Plus2 pins. S3 boards stay awake.
+  return;
+#endif
   setState(RunState::Boot);
   M5.Display.setBrightness(0);
   webSocket.disconnect();
@@ -1837,19 +1939,34 @@ static void maybeSleep() {
 }
 
 void setup() {
+#if KOMM_A2DP
   pinMode(PIN_HOLD, OUTPUT);
   digitalWrite(PIN_HOLD, HIGH);
+#endif
   Serial.begin(115200);
   delay(20);
   mbedtls_platform_set_calloc_free(kommTlsCalloc, kommTlsFree);
 
   auto cfg = M5.config();
+#if defined(KOMM_BOARD_STICKS3)
+  cfg.fallback_board = m5::board_t::board_M5StickS3;
+#elif defined(KOMM_BOARD_CORES3_LITE)
+  cfg.fallback_board = m5::board_t::board_M5StackCoreS3;
+#else
   cfg.fallback_board = m5::board_t::board_M5StickCPlus2;
+#endif
+  Serial.printf("kort %s duplex %d a2dp %d\n", kBoard.deviceId, kBoard.duplex ? 1 : 0,
+                kBoard.a2dp ? 1 : 0);
   prefs.begin("komm", false);
   loadConfig();
   cfg.internal_mic = true;
+#if KOMM_A2DP
   cfg.internal_spk = !useSpk2;
   cfg.external_speaker.hat_spk2 = useSpk2;
+#else
+  cfg.internal_spk = true;
+  cfg.external_speaker.hat_spk2 = false;
+#endif
   M5.begin(cfg);
   M5.Display.setRotation(1);
   M5.Display.setFont(&fonts::Font2);
@@ -1883,8 +2000,13 @@ void setup() {
         uint32_t cutAt = 0;
         for (;;) {
           bool live = listenLive;
+#if KOMM_A2DP
           int released = gpio_get_level(static_cast<gpio_num_t>(PIN_BTN_A)) != 0;
           int power = gpio_get_level(GPIO_NUM_35) == 0;
+#else
+          int released = 0;
+          int power = 0;
+#endif
           if (!live || !released) high = 0;
           else if (++high >= 2) wantAbort = 1;
           if (live && power) wantAbort = 2;
@@ -1974,7 +2096,7 @@ void loop() {
   serviceAirpods();
   if (pttHeld) serviceCapture();
   servicePlayback();
-  if (state == RunState::Think && !pttHeld && millis() - thinkSince > 8000 &&
+  if (state == RunState::Think && !pttHeld && millis() - thinkSince > 20000 &&
       stereoAvailFrames() == 0 && ringAvailSamples() == 0) {
     Serial.println("vantan slut");
     setState(RunState::Idle);

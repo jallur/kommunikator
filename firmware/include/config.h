@@ -6,6 +6,7 @@
 #include "secrets.h"
 #endif
 #include "isrg_root_x1.h"
+#include "board.h"
 
 #ifndef KOMM_RELAY_HOST
 #define KOMM_RELAY_HOST "trek.aldenback.com"
@@ -23,11 +24,11 @@
 #define KOMM_CA_CERT ISRG_ROOT_X1
 #endif
 
-// PCM rates announced to the relay. Both are in the xAI PCM rate list.
-// Uplink stays 16 kHz (wideband, for the mic). Playback is 44.1 kHz, the
-// same rate AirPods play, so the relay asks Grok for it and does not resample.
-static const uint32_t CAPTURE_HZ = 16000;
-static const uint32_t PLAYBACK_HZ = 44100;
+// Rates come from the board profile. Plus2 asks for 44.1 kHz because that
+// is what its AirPods sink plays. S3 boards ask for 24 kHz and play it
+// on their own speaker.
+static constexpr uint32_t CAPTURE_HZ = kBoard.captureHz;
+static constexpr uint32_t PLAYBACK_HZ = kBoard.playbackHz;
 static const size_t CAPTURE_SAMPLES = 320;  // 20 ms
 
 // StickC-Plus2 pin map:
