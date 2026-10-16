@@ -55,6 +55,9 @@ class Settings:
     # Mentioned only in the OpenAI-compatibility note, not the session table.
     transcription_model: str = "grok-transcribe"
     grok_bot_webhook_url: str | None = None
+    # Off unless KOMM_DUMP_AUDIO=1. Files land in the compose volume.
+    dump_audio: bool = False
+    dump_audio_dir: str = "/var/lib/kommunikator/audio"
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.xai_realtime_url)
@@ -92,6 +95,7 @@ class Settings:
         )
         webhook = os.environ.get("GROK_BOT_WEBHOOK_URL", "").strip() or None
         instructions = os.environ.get("XAI_INSTRUCTIONS", "").strip() or DEFAULT_INSTRUCTIONS
+        dump_dir = os.environ.get("KOMM_DUMP_DIR", "").strip() or "/var/lib/kommunikator/audio"
         return cls(
             xai_api_key=os.environ.get("XAI_API_KEY", "").strip(),
             device_tokens=tokens,
@@ -104,4 +108,10 @@ class Settings:
             reasoning_effort=os.environ.get("XAI_REASONING_EFFORT", "none").strip(),
             transcription_model=os.environ.get("XAI_TRANSCRIPTION_MODEL", "grok-transcribe").strip(),
             grok_bot_webhook_url=webhook,
+            dump_audio=_env_flag("KOMM_DUMP_AUDIO"),
+            dump_audio_dir=dump_dir,
         )
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}

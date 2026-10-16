@@ -7,6 +7,10 @@ services:
     build: ./src
     env_file:
       - .env
+    # KOMM_DUMP_AUDIO=1 writes one WAV per turn here. The flag stays off
+    # until someone wants to hear what xAI received.
+    volumes:
+      - ./data/uplink:/var/lib/kommunikator/audio
     restart: unless-stopped
     networks:
       - proxy

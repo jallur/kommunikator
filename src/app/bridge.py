@@ -20,6 +20,7 @@ from .protocol import (
 )
 from .resample import Pcm16Resampler
 from .settings import Settings
+from .uplink_audio import uplink_matches_session, write_uplink_wav
 from .xai import XaiFactory, XaiLink, dumps, realtime_url
 
 log = logging.getLogger("kommunikator.bridge")
@@ -46,6 +47,10 @@ class _Turn:
         self.level_peak = 0
         self.level_sq = 0
         self.level_n = 0
+        self.uplink = bytearray()
+        self.format_error: str | None = None
+        self.dumped = False
+        self.level_logged = False
         self.transcript_ready = asyncio.Event()
         self.reply_task: asyncio.Task[None] | None = None
 
@@ -135,9 +140,18 @@ async def bridge(
             for start in range(0, len(view), _DEVICE_AUDIO_CHUNK):
                 await device.send_bytes(bytes(view[start : start + _DEVICE_AUDIO_CHUNK]))
 
+    session = build_session_update(settings, hello.playback_rate)
+    declared = session["session"]["audio"]["input"]["format"]
+    log.info(
+        "uplink format pcm16le mono %s session %s %s dump %s",
+        settings.xai_input_rate,
+        declared.get("type"),
+        declared.get("rate"),
+        settings.dump_audio_dir if settings.dump_audio else "off",
+    )
     try:
         async with xai_lock:
-            await link.send(dumps(build_session_update(settings, hello.playback_rate)))
+            await link.send(dumps(session))
         conversation_id = await _wait_session_updated(link, token, memory)
         await send_json(
             {
@@ -153,7 +167,17 @@ async def bridge(
         turn = _Turn()
         async with asyncio.TaskGroup() as group:
             group.create_task(
-                _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lock)
+                _device_to_xai(
+                    device,
+                    link,
+                    uplink,
+                    turn,
+                    send_json,
+                    settings,
+                    xai_lock,
+                    hello.device_id,
+                    session,
+                )
             )
             group.create_task(_xai_to_device(link, downlink, turn, send_json, send_bytes, xai_lock))
     except ExceptionGroup as group:
@@ -250,7 +274,53 @@ async def _answer_after_transcript(link, settings, turn, xai_lock, turn_id: int,
     await send_json({"type": "relay", "event": "answer", "turn": turn_id, "chars": len(quote)})
 
 
-async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lock) -> None:
+def _log_level(
+    turn: _Turn, turn_id: int, settings: Settings, session: dict, force: bool = False
+) -> None:
+    if turn.level_logged:
+        return
+    if not force and turn.level_n == 0 and not turn.uplink and not turn.format_error:
+        return
+    turn.level_logged = True
+    rms = int((turn.level_sq / turn.level_n) ** 0.5) if turn.level_n else 0
+    declared = (session.get("session") or {}).get("audio", {}).get("input", {}).get("format", {})
+    log.info(
+        "uplink level turn %s peak %s rms %s samples %s pcm16le mono %s session %s %s",
+        turn_id,
+        turn.level_peak,
+        rms,
+        turn.level_n,
+        settings.xai_input_rate,
+        declared.get("type"),
+        declared.get("rate"),
+    )
+    if turn.format_error:
+        log.error("uplink format mismatch turn %s %s", turn_id, turn.format_error)
+
+
+def _save_uplink(settings: Settings, turn: _Turn, device_id: str | None) -> None:
+    if not settings.dump_audio or turn.dumped or not turn.uplink:
+        return
+    pcm = bytes(turn.uplink)
+    turn.uplink.clear()
+    turn.dumped = True
+    try:
+        path = write_uplink_wav(
+            settings.dump_audio_dir,
+            device_id or "device",
+            turn.id,
+            pcm,
+            settings.xai_input_rate,
+        )
+    except Exception:
+        log.exception("uplink wav failed turn %s", turn.id)
+        return
+    log.info("uplink wav turn %s %s", turn.id, path)
+
+
+async def _device_to_xai(
+    device, link, uplink, turn, send_json, settings, xai_lock, device_id, session
+) -> None:
     try:
         while True:
             try:
@@ -267,11 +337,16 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
                     turn.device_bytes += len(data)
                     pcm = uplink.process(data)
                     if pcm:
+                        problem = uplink_matches_session(session, settings.xai_input_rate, pcm)
+                        if problem:
+                            turn.format_error = problem
                         _note_level(turn, pcm)
                         async with xai_lock:
                             if turn.capturing:
                                 await link.send(pcm)
                                 turn.sent_audio = True
+                                if settings.dump_audio:
+                                    turn.uplink.extend(pcm)
                 continue
             text = incoming.get("text")
             if not text:
@@ -281,6 +356,8 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
             if kind == "ping":
                 await send_json({"type": "pong"})
             elif kind == "ptt" and payload.get("state") == "down":
+                _log_level(turn, turn.id, settings, session)
+                _save_uplink(settings, turn, device_id)
                 turn_id = _turn_id(payload)
                 log.info("ptt down turn %s", turn_id)
                 turn.capturing = True
@@ -290,6 +367,10 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
                 turn.level_peak = 0
                 turn.level_sq = 0
                 turn.level_n = 0
+                turn.uplink.clear()
+                turn.format_error = None
+                turn.dumped = False
+                turn.level_logged = False
                 turn.transcript_ready.clear()
                 async with xai_lock:
                     turn.reply_pending = False
@@ -331,14 +412,8 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
                         {"type": "relay", "event": "empty", "turn": up_id, "bytes": audio_bytes}
                     )
                     continue
-                rms = int((turn.level_sq / turn.level_n) ** 0.5) if turn.level_n else 0
-                log.info(
-                    "uplink level turn %s peak %s rms %s samples %s",
-                    up_id,
-                    turn.level_peak,
-                    rms,
-                    turn.level_n,
-                )
+                _log_level(turn, up_id, settings, session, force=True)
+                _save_uplink(settings, turn, device_id)
                 log.info("ptt up turn %s bytes %s commit", up_id, audio_bytes)
                 await send_json(
                     {"type": "relay", "event": "commit", "turn": up_id, "bytes": audio_bytes}
@@ -347,6 +422,8 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
                     _answer_after_transcript(link, settings, turn, xai_lock, up_id, send_json)
                 )
     finally:
+        _log_level(turn, turn.id, settings, session)
+        _save_uplink(settings, turn, device_id)
         turn.reply_pending = False
         if turn.reply_task is not None and not turn.reply_task.done():
             turn.reply_task.cancel()
