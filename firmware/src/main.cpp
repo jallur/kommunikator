@@ -359,6 +359,9 @@ static bool airpodsOn() {
 static bool a2dpMediaOn = false;
 static bool a2dpMediaWant = false;
 static unsigned long a2dpCmdMs = 0;
+// Stays set for the whole reply. Clearing it whenever the buffer dips under
+// the start watermark suspends A2DP and opens a gap of about a second.
+static volatile bool airpodLatched = false;
 #else
 static int a2dpState = 0;
 static int appliedA2dp = 0;
@@ -367,6 +370,7 @@ static bool airpodsOn() { return false; }
 static bool a2dpMediaOn = false;
 static bool a2dpMediaWant = false;
 static unsigned long a2dpCmdMs = 0;
+static volatile bool airpodLatched = false;
 #endif
 static IPAddress relayIp;
 static bool relayIpOk = false;
@@ -515,23 +519,11 @@ static void stereoFromPcm(const uint8_t* data, size_t len) {
 
 #if KOMM_A2DP
 static int32_t fillAirpods(Frame* frame, int32_t count) {
-  static bool primed = false;
-  constexpr size_t kPrimeFrames = 26460;
-  constexpr unsigned long kGapMs = 250;
-  if (!stereoRing || pttHeld || !airpodsOn()) {
-    primed = false;
+  if (!stereoRing || pttHeld || !airpodsOn() || !airpodLatched || count <= 0) {
     fillEmptyCalls++;
     return 0;
   }
   size_t have = stereoAvailFrames();
-  bool ended = lastAudioMs != 0 && millis() - lastAudioMs > kGapMs;
-  if (!primed) {
-    if (have == 0 || (have < kPrimeFrames && !ended)) {
-      fillEmptyCalls++;
-      return 0;
-    }
-    primed = true;
-  }
   size_t n = have < static_cast<size_t>(count) ? have : static_cast<size_t>(count);
   size_t r = stR;
   for (size_t i = 0; i < n; i++) {
@@ -544,12 +536,13 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
     portENTER_CRITICAL(&stMux);
     if (stR == r) stR = next;
     portEXIT_CRITICAL(&stMux);
-  } else if (ended) {
-    primed = false;
+    fillOutFrames += static_cast<uint32_t>(n);
+  } else {
+    fillEmptyCalls++;
   }
-  if (n == 0) fillEmptyCalls++;
-  else fillOutFrames += static_cast<uint32_t>(n);
-  return static_cast<int32_t>(n);
+  // The wrapper already cleared the buffer. Returning the full request keeps
+  // the A2DP clock running through the quiet between xAI's packets.
+  return count;
 }
 #endif
 
@@ -1582,15 +1575,12 @@ static void loadConfig() {
     uint8_t flag = 0;
     if (nvs_get_u8(handle, "tls", &flag) == ESP_OK) useTls = flag != 0;
     if (nvs_get_u8(handle, "spk2", &flag) == ESP_OK) useSpk2 = flag != 0;
+    if (nvsString(handle, "airname", value)) {
+      strncpy(a2dpName, value.c_str(), sizeof(a2dpName) - 1);
+      a2dpName[sizeof(a2dpName) - 1] = '\0';
+    }
     nvs_close(handle);
   }
-#if KOMM_A2DP
-  String airName = prefs.getString("airname", "");
-  if (airName.length() > 0) {
-    strncpy(a2dpName, airName.c_str(), sizeof(a2dpName) - 1);
-    a2dpName[sizeof(a2dpName) - 1] = '\0';
-  }
-#endif
   playVolume = prefs.getUChar("vol", playVolume);
   screenBright = prefs.getUChar("bright", screenBright);
 #ifdef KOMM_WIFI_SSID
@@ -2198,8 +2188,18 @@ static void servicePlayback() {
   if (airpodsOn()) {
     if (!pttHeld && M5.Speaker.isRunning()) releaseSpeaker();
     size_t queued = stereoAvailFrames();
-    bool ready = queued >= 26460 || (queued > 0 && lastAudioMs != 0 && millis() - lastAudioMs > 250);
-    bool feed = !pttHeld && ready;
+    unsigned long age = lastAudioMs == 0 ? 100000ul : millis() - lastAudioMs;
+    // 600 ms at 44.1 kHz. Used only to open the stream, not to keep it open.
+    constexpr size_t kPrimeFrames = 26460;
+    constexpr unsigned long kTailMs = 600;
+    if (pttHeld) {
+      airpodLatched = false;
+    } else if (!airpodLatched) {
+      airpodLatched = queued >= kPrimeFrames || (queued > 0 && age > kTailMs);
+    } else if (queued == 0 && age > kTailMs) {
+      airpodLatched = false;
+    }
+    bool feed = airpodLatched;
     static bool fed = false;
     if (feed != fed) {
       fed = feed;
@@ -2207,13 +2207,13 @@ static void servicePlayback() {
     }
     setAirpodMedia(feed);
     static int coexMode = -1;
-    int want = feed ? 1 : 0;
+    int want = feed ? 1 : 2;
     if (want != coexMode) {
       coexMode = want;
-      esp_coex_preference_set(want == 1 ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_WIFI);
-      Serial.printf("ljud radio %s\n", want == 1 ? "bt" : "wifi");
+      esp_coex_preference_set(want == 1 ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_BALANCE);
+      Serial.printf("ljud radio %s\n", want == 1 ? "bt" : "balans");
     }
-    if (state == RunState::Speak && stereoAvailFrames() == 0 && millis() - lastAudioMs > 200) {
+    if (!feed && state == RunState::Speak && queued == 0 && age > kTailMs) {
       setState(RunState::Idle);
     }
     return;
