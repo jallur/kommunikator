@@ -102,6 +102,10 @@ static portMUX_TYPE stMux = portMUX_INITIALIZER_UNLOCKED;
 static size_t ringR = 0;
 static size_t ringW = 0;
 static unsigned long lastAudioMs = 0;
+static volatile uint32_t fillOutFrames = 0;
+static volatile uint32_t fillEmptyCalls = 0;
+static volatile uint32_t stereoDropFrames = 0;
+static volatile uint32_t monoDropSamples = 0;
 static bool captureReplay = true;
 static uint8_t* replayBytes = nullptr;
 static size_t replayCap = 0;
@@ -109,6 +113,7 @@ static size_t replayLen = 0;
 static uint8_t playVolume = 200;
 static uint8_t screenBright = 170;
 static bool setupOpen = false;
+static bool swallowPwrClick = false;
 static int setupSel = 0;
 static uint32_t playClock = 48000;
 static uint8_t buzzerMag = 48;
@@ -224,7 +229,10 @@ static void ringPush(const uint8_t* data, size_t len) {
   if (captureReplay) replayAppend(data, len);
   portENTER_CRITICAL(&audioMux);
   for (size_t i = 0; i < len; i += 2) {
-    while (ringCountHeld() >= kRingBytes - 2) ringR = (ringR + 2) % kRingBytes;
+    while (ringCountHeld() >= kRingBytes - 2) {
+      ringR = (ringR + 2) % kRingBytes;
+      monoDropSamples++;
+    }
     audioRing[ringW] = data[i];
     ringW = (ringW + 1) % kRingBytes;
     audioRing[ringW] = data[i + 1];
@@ -281,11 +289,11 @@ static void onA2dpAudio(esp_a2d_audio_state_t audio, void*) {
 
 static void setAirpodMedia(bool run) {
   if (!airpodsOn()) return;
-  if (run == a2dpMediaWant && run == a2dpMediaOn) return;
-  if (!run && !a2dpMediaOn && !a2dpMediaWant) return;
+  if (run == a2dpMediaWant) return;
+  a2dpMediaWant = run;
   esp_err_t err = esp_a2d_media_ctrl(run ? ESP_A2D_MEDIA_CTRL_START : ESP_A2D_MEDIA_CTRL_SUSPEND);
   Serial.printf("bt media %s %d\n", run ? "start" : "paus", static_cast<int>(err));
-  if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) a2dpMediaWant = run;
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) a2dpMediaWant = !run;
 }
 
 static void cacheRelayIp(const char* host) {
@@ -354,6 +362,7 @@ static void stereoFromPcm(const uint8_t* data, size_t len) {
         portENTER_CRITICAL(&stMux);
         stR = (stR + 4) % kStereoBytes;
         portEXIT_CRITICAL(&stMux);
+        stereoDropFrames++;
       }
       int16_t sample = static_cast<int16_t>(mixed);
       stereoRing[w] = static_cast<uint8_t>(sample);
@@ -377,12 +386,16 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
   constexpr unsigned long kGapMs = 250;
   if (!stereoRing || pttHeld || !airpodsOn()) {
     primed = false;
+    fillEmptyCalls++;
     return 0;
   }
   size_t have = stereoAvailFrames();
   bool ended = lastAudioMs != 0 && millis() - lastAudioMs > kGapMs;
   if (!primed) {
-    if (have == 0 || (have < kPrimeFrames && !ended)) return 0;
+    if (have == 0 || (have < kPrimeFrames && !ended)) {
+      fillEmptyCalls++;
+      return 0;
+    }
     primed = true;
   }
   size_t n = have < static_cast<size_t>(count) ? have : static_cast<size_t>(count);
@@ -400,7 +413,19 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
   } else if (ended) {
     primed = false;
   }
+  if (n == 0) fillEmptyCalls++;
+  else fillOutFrames += static_cast<uint32_t>(n);
   return static_cast<int32_t>(n);
+}
+
+static void logAudio(const char* why) {
+  unsigned age = lastAudioMs == 0 ? 0u : static_cast<unsigned>(millis() - lastAudioMs);
+  Serial.printf(
+      "ljud %s mono %u stereo %u ut %u tom %u tapS %u tapM %u media %d/%d ptt %d alder %u %s\n",
+      why, static_cast<unsigned>(ringAvailSamples()), static_cast<unsigned>(stereoAvailFrames()),
+      static_cast<unsigned>(fillOutFrames), static_cast<unsigned>(fillEmptyCalls),
+      static_cast<unsigned>(stereoDropFrames), static_cast<unsigned>(monoDropSamples),
+      a2dpMediaOn ? 1 : 0, a2dpMediaWant ? 1 : 0, pttHeld ? 1 : 0, age, stateName(state));
 }
 
 static void releaseSpeaker();
@@ -734,6 +759,10 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
         ringPush(payload, length);
         setState(RunState::Speak);
         markActivity();
+        Serial.printf("ljud in %u ", static_cast<unsigned>(length));
+        logAudio("paket");
+      } else {
+        Serial.printf("ljud slapp %u B under ptt\n", static_cast<unsigned>(length));
       }
       break;
     case WStype_ERROR:
@@ -995,6 +1024,7 @@ static void beginPtt() {
   ringClear();
   setAirpodMedia(false);
   esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  logAudio("rensar");
   M5.Speaker.stop();
   if (airpodsOn() && !useSpk2 && !M5.Speaker.isRunning()) startSpeaker();
   if (useSpk2) {
@@ -1016,6 +1046,30 @@ static void beginPtt() {
   userLine = "";
   uiDirty = true;
   markActivity();
+}
+
+static bool activityBusy() {
+  return pttHeld || state == RunState::Listen || state == RunState::Think || state == RunState::Speak;
+}
+
+static void abortActivity() {
+  bool wasPtt = pttHeld;
+  pttHeld = false;
+  capQueued = false;
+  M5.Mic.end();
+  M5.Speaker.stop();
+  ringClear();
+  setAirpodMedia(false);
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  if (wasPtt && sessionReady) sendPtt("up");
+  if (!airpodsOn() && !M5.Speaker.isRunning()) startSpeaker();
+  setupOpen = false;
+  swallowPwrClick = true;
+  setState(sessionReady ? RunState::Idle : RunState::Connecting);
+  uiDirty = true;
+  markActivity();
+  Serial.println("avbryt");
+  logAudio("avbryt");
 }
 
 static void endPtt() {
@@ -1210,6 +1264,10 @@ static void draw() {
 
 static void serviceCapture() {
   if (!pttHeld || !sessionReady) return;
+  if ((GPIO.in1.data & (1UL << (GPIO_NUM_35 - 32))) == 0) {
+    abortActivity();
+    return;
+  }
   if (!capQueued) {
     capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
     return;
@@ -1360,18 +1418,42 @@ static void serviceSerial() {
   }
 }
 
+static void serviceAudioLog() {
+  static unsigned long last = 0;
+  static uint32_t prevOut = 0;
+  static uint32_t prevEmpty = 0;
+  size_t queued = airpodsOn() ? stereoAvailFrames() : ringAvailSamples();
+  bool hot = queued > 0 || pttHeld || state == RunState::Speak || state == RunState::Listen ||
+             state == RunState::Think;
+  if (!hot || millis() - last < 500) return;
+  last = millis();
+  uint32_t outNow = fillOutFrames;
+  uint32_t emptyNow = fillEmptyCalls;
+  Serial.printf("ljud puls +ut %u +tom %u\n", static_cast<unsigned>(outNow - prevOut),
+                static_cast<unsigned>(emptyNow - prevEmpty));
+  prevOut = outNow;
+  prevEmpty = emptyNow;
+  logAudio("puls");
+}
+
 static void servicePlayback() {
   if (airpodsOn()) {
     if (!pttHeld && M5.Speaker.isRunning()) releaseSpeaker();
     size_t queued = stereoAvailFrames();
     bool ready = queued >= 26460 || (queued > 0 && lastAudioMs != 0 && millis() - lastAudioMs > 250);
     bool feed = !pttHeld && ready;
+    static bool fed = false;
+    if (feed != fed) {
+      fed = feed;
+      logAudio(feed ? "spela" : "vantar");
+    }
     setAirpodMedia(feed);
     static int coexMode = -1;
     int want = feed ? 1 : 0;
     if (want != coexMode) {
       coexMode = want;
       esp_coex_preference_set(want == 1 ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_WIFI);
+      Serial.printf("ljud radio %s\n", want == 1 ? "bt" : "wifi");
     }
     if (state == RunState::Speak && stereoAvailFrames() == 0 && millis() - lastAudioMs > 200) {
       setState(RunState::Idle);
@@ -1487,17 +1569,24 @@ void loop() {
     return;
   }
 
+  if (state != RunState::Provision && millis() > 1500 &&
+      (M5.BtnPWR.wasClicked() || (activityBusy() && M5.BtnPWR.isPressed()))) {
+    if (activityBusy()) {
+      abortActivity();
+    } else if (swallowPwrClick) {
+      swallowPwrClick = false;
+    } else {
+      setupOpen = !setupOpen;
+      uiDirty = true;
+      markActivity();
+      Serial.println(setupOpen ? "installning oppnas" : "installning stangs");
+    }
+  }
+
   if (state == RunState::Wifi) {
     if (WiFi.status() == WL_CONNECTED) startWebSocket();
   } else if (wsStarted) {
     webSocket.loop();
-  }
-
-  if (!pttHeld && state != RunState::Provision && millis() > 1500 && M5.BtnPWR.wasClicked()) {
-    setupOpen = !setupOpen;
-    uiDirty = true;
-    markActivity();
-    Serial.println(setupOpen ? "installning oppnas" : "installning stangs");
   }
   if (setupOpen) {
     if (M5.BtnB.wasClicked()) {
@@ -1524,6 +1613,7 @@ void loop() {
   serviceAirpods();
   if (pttHeld) serviceCapture();
   servicePlayback();
+  serviceAudioLog();
 
   if (millis() - lastBatteryMs > 10000) {
     lastBatteryMs = millis();
