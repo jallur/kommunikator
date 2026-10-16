@@ -667,6 +667,200 @@ static void micWaitIdle() {
   for (int i = 0; i < 40 && micInRead; i++) delay(2);
 }
 
+#if KOMM_A2DP
+// M5Unified 0.2.5's mic task does this division for the SPM1423. The
+// legacy driver clock plus `sample <<= 4` was a square wave. Calling
+// M5.Mic.record from our task only ever returned one 64-sample buffer:
+// isRecording() is still false before their task wakes, and the next
+// record() then waits forever on a buffer their task never finishes.
+static void calcPdmDiv(uint32_t* div_a, uint32_t* div_b, uint32_t* div_n,
+                       uint32_t baseClock, uint32_t targetFreq) {
+  if (baseClock <= (targetFreq << 1)) {
+    *div_n = 2;
+    *div_a = 1;
+    *div_b = 0;
+    return;
+  }
+  uint32_t save_n = 255;
+  uint32_t save_a = 63;
+  uint32_t save_b = 62;
+  if (targetFreq) {
+    float fdiv = static_cast<float>(baseClock) / static_cast<float>(targetFreq);
+    uint32_t n = static_cast<uint32_t>(fdiv);
+    if (n < 256) {
+      fdiv -= n;
+      float check_base = static_cast<float>(baseClock);
+      while (static_cast<int32_t>(targetFreq) >= 0) {
+        targetFreq <<= 1;
+        check_base *= 2;
+      }
+      float check_target = static_cast<float>(targetFreq);
+      uint32_t save_diff = UINT32_MAX;
+      if (n < 255) {
+        save_a = 1;
+        save_b = 0;
+        save_n = n + 1;
+        save_diff = static_cast<uint32_t>(fabsf(check_target - check_base / static_cast<float>(save_n)));
+      }
+      for (uint32_t a = 1; a < 64; ++a) {
+        uint32_t b = static_cast<uint32_t>(roundf(static_cast<float>(a) * fdiv));
+        if (a <= b) continue;
+        float got = (check_base * static_cast<float>(a)) /
+                    static_cast<float>(n * a + b);
+        uint32_t diff = static_cast<uint32_t>(fabsf(check_target - got));
+        if (save_diff <= diff) continue;
+        save_diff = diff;
+        save_a = a;
+        save_b = b;
+        save_n = n;
+        if (!diff) break;
+      }
+    }
+  }
+  *div_n = save_n;
+  *div_a = save_a;
+  *div_b = save_b;
+}
+
+static void tunePdmClock(uint32_t sampleRate) {
+  constexpr uint32_t kPll = 80000000;
+  constexpr uint32_t kBits = 64;
+  constexpr uint32_t kDivM = 2;
+  constexpr uint32_t kOver = 2;
+  uint32_t div_a = 1;
+  uint32_t div_b = 0;
+  uint32_t div_n = 2;
+  calcPdmDiv(&div_a, &div_b, &div_n, kPll / (kBits * kDivM), sampleRate * kOver);
+  I2S0.pdm_conf.rx_sinc_dsr_16_en = 1;
+  I2S0.pdm_conf.pdm2pcm_conv_en = 1;
+  I2S0.pdm_conf.rx_pdm_en = 1;
+  I2S0.sample_rate_conf.rx_bck_div_num = kDivM;
+  I2S0.clkm_conf.clkm_div_a = div_a;
+  I2S0.clkm_conf.clkm_div_b = div_b;
+  I2S0.clkm_conf.clkm_div_num = div_n;
+  I2S0.clkm_conf.clka_en = 0;
+  I2S0.conf.rx_reset = 1;
+  I2S0.conf.rx_fifo_reset = 1;
+  I2S0.conf.rx_reset = 0;
+  I2S0.conf.rx_fifo_reset = 0;
+  Serial.printf("mic pdm n=%u a=%u b=%u\n", div_n, div_a, div_b);
+}
+
+static int32_t pdmSum0 = 0;
+static int32_t pdmSum1 = 0;
+static int32_t pdmOffset = 0;
+static int pdmOs = 2;
+static int16_t pdmCarry = 0;
+static bool pdmCarryOn = false;
+static bool pdmDmaLogged = false;
+
+static void pdmReset() {
+  pdmSum0 = 0;
+  pdmSum1 = 0;
+  pdmOffset = 0;
+  pdmOs = 2;
+  pdmCarry = 0;
+  pdmCarryOn = false;
+  pdmDmaLogged = false;
+}
+
+static int16_t pdmClip(int32_t value) {
+  if (value < INT16_MIN + 16) return static_cast<int16_t>(INT16_MIN + 16);
+  if (value > INT16_MAX - 16) return static_cast<int16_t>(INT16_MAX - 16);
+  return static_cast<int16_t>(value);
+}
+
+// Same oversampling, channel swap, DC tracker and gain as Mic_Class::mic_task
+// on classic ESP32. Two raw pairs become two PCM samples at CAPTURE_HZ.
+static size_t pdmFeed(const int16_t* src, size_t n, int16_t* dst, size_t cap, size_t* used) {
+  size_t in = 0;
+  size_t out = 0;
+  while (out + 1 < cap) {
+    while (pdmOs > 0) {
+      int16_t s0;
+      int16_t s1;
+      if (pdmCarryOn) {
+        if (in >= n) {
+          *used = in;
+          return out;
+        }
+        s0 = pdmCarry;
+        s1 = src[in++];
+        pdmCarryOn = false;
+      } else if (in + 1 < n) {
+        s0 = src[in++];
+        s1 = src[in++];
+      } else {
+        if (in < n) {
+          pdmCarry = src[in++];
+          pdmCarryOn = true;
+        }
+        *used = in;
+        return out;
+      }
+      pdmSum0 += s0;
+      pdmSum1 += s1;
+      pdmOs--;
+    }
+    pdmOs = 2;
+    int32_t sv0 = pdmSum1;
+    int32_t sv1 = pdmSum0;
+    int32_t mixed = (sv0 + sv1) << 3;
+    pdmOffset -= (mixed + pdmOffset + 16) >> 5;
+    int32_t off = (pdmOffset + 8) >> 4;
+    dst[out++] = pdmClip((sv0 + off) * 4);
+    dst[out++] = pdmClip((sv1 + off) * 4);
+    pdmSum0 = 0;
+    pdmSum1 = 0;
+  }
+  *used = in;
+  return out;
+}
+
+static bool installPdm(int dmaCount) {
+  i2s_config_t i2sConfig;
+  memset(&i2sConfig, 0, sizeof(i2sConfig));
+  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
+  i2sConfig.sample_rate = 48000;
+  i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
+  i2sConfig.communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT;
+  i2sConfig.dma_buf_count = dmaCount;
+  i2sConfig.dma_buf_len = 64;
+
+  i2s_pin_config_t pinConfig;
+  memset(&pinConfig, 0xFF, sizeof(pinConfig));
+  pinConfig.bck_io_num = I2S_PIN_NO_CHANGE;
+  pinConfig.ws_io_num = PIN_MIC_CLK;
+  pinConfig.data_out_num = I2S_PIN_NO_CHANGE;
+  pinConfig.data_in_num = PIN_MIC_DATA;
+  pinConfig.mck_io_num = I2S_PIN_NO_CHANGE;
+
+  esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2sConfig, 0, nullptr);
+  if (err != ESP_OK) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    err = i2s_driver_install(I2S_NUM_0, &i2sConfig, 0, nullptr);
+  }
+  if (err != ESP_OK) return false;
+  if (i2s_set_pin(I2S_NUM_0, &pinConfig) != ESP_OK) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+  i2s_stop(I2S_NUM_0);
+  tunePdmClock(CAPTURE_HZ);
+  if (i2s_start(I2S_NUM_0) != ESP_OK) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+  int16_t junk[64];
+  size_t dummy = 0;
+  i2s_read(I2S_NUM_0, junk, sizeof(junk), &dummy, pdMS_TO_TICKS(10));
+  i2s_read(I2S_NUM_0, junk, sizeof(junk), &dummy, pdMS_TO_TICKS(10));
+  return true;
+}
+
+#endif
+
 static void micReader(void*) {
   int16_t tmp[64];
   for (;;) {
@@ -678,17 +872,46 @@ static void micReader(void*) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
+#if KOMM_A2DP
+    size_t bytes = 0;
+    int16_t raw[128];
+    esp_err_t err = i2s_read(I2S_NUM_0, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(20));
+    bool pushed = false;
+    if (err == ESP_OK && bytes >= sizeof(int16_t)) {
+      if (!pdmDmaLogged) {
+        pdmDmaLogged = true;
+        Serial.printf("mic dma %u\n", static_cast<unsigned>(bytes));
+      }
+      size_t n = bytes / sizeof(int16_t);
+      size_t off = 0;
+      while (off < n) {
+        size_t used = 0;
+        size_t produced = pdmFeed(raw + off, n - off, tmp, 64, &used);
+        if (produced) {
+          micPush(tmp, produced);
+          pushed = true;
+        }
+        if (used == 0) break;
+        off += used;
+        if (!produced) break;
+      }
+    }
+    micInRead = false;
+    if (!pushed) vTaskDelay(pdMS_TO_TICKS(5));
+#else
     size_t got = 0;
-    // M5Unified owns the PDM clock, the ESP32 channel swap and the DC
-    // offset. A raw I2S read plus a shift of 4 produced energy that VAD
-    // committed and then refused to transcribe.
+    // Wait until the background task has actually started, then until it
+    // has filled tmp. isRecording() is also false before the task wakes,
+    // and treating that as a finished buffer pushes stack noise.
     if (M5.Mic.record(tmp, 64, CAPTURE_HZ, false)) {
-      for (int i = 0; i < 30 && M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
+      for (int i = 0; i < 20 && !M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
+      for (int i = 0; i < 40 && M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
       if (!M5.Mic.isRecording()) got = sizeof(tmp);
     }
     if (got >= sizeof(int16_t)) micPush(tmp, got / sizeof(int16_t));
     micInRead = false;
     if (got < sizeof(int16_t)) vTaskDelay(pdMS_TO_TICKS(5));
+#endif
   }
 }
 
@@ -714,12 +937,20 @@ static void stopMic() {
   capLive = false;
   if (!micOpen) return;
   micWaitIdle();
+#if KOMM_A2DP
+  i2s_stop(I2S_NUM_0);
+  i2s_driver_uninstall(I2S_NUM_0);
+#else
   M5.Mic.end();
+#endif
   micOpen = false;
 }
 
 static void armMic(const char* how) {
   micResetRing();
+#if KOMM_A2DP
+  pdmReset();
+#endif
   micOpen = true;
   micSent = 0;
   micDrop = 0;
@@ -734,23 +965,32 @@ static void armMic(const char* how) {
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 }
 
+#if KOMM_A2DP
+static bool startPdmMic() {
+  const int counts[] = {8, 4, 2};
+  for (int count : counts) {
+    if (!installPdm(count)) continue;
+    Serial.printf("mic dma-buf %d\n", count);
+    armMic("pdm");
+    return true;
+  }
+  Serial.println("mic begin nej");
+  return false;
+}
+#endif
+
 static bool startMic() {
   stopMic();
   releaseSpeaker();
-  // Plus2's SPM1423 needs M5Unified's PDM clock (DSR128) and DC offset.
-  // The legacy driver plus `sample <<= 4` saturated into a square wave:
-  // xAI committed it and then produced neither a transcript nor audio.
   M5.Mic.end();
+#if KOMM_A2DP
+  // GPIO0 is the SPM1423 clock and the Hat SPK2 word select. The speaker
+  // has to be gone before the PDM driver claims it.
+  return startPdmMic();
+#else
   auto mic = M5.Mic.config();
   mic.dma_buf_count = 4;
   mic.dma_buf_len = 64;
-#if KOMM_A2DP
-  // StickC Plus2 PDM defaults in M5Unified 0.2.5. Kept explicit so a
-  // later speaker config cannot leave the mic at the old shift-of-4 gain.
-  mic.over_sampling = 2;
-  mic.magnification = 16;
-  mic.noise_filter_level = 0;
-#endif
   M5.Mic.config(mic);
   if (!M5.Mic.begin()) {
     Serial.println("mic begin nej");
@@ -758,6 +998,7 @@ static bool startMic() {
   }
   armMic("m5");
   return true;
+#endif
 }
 
 static bool wsCanSend();
