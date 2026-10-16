@@ -57,6 +57,8 @@ def test_session_update_matches_documented_shape() -> None:
     assert "norska" in session["instructions"]
     assert "danska" in session["instructions"]
     assert "extremt kortfattat" in session["instructions"]
+    assert "Upprepa inte frågan" in session["instructions"]
+    assert "Svar: Två." in session["instructions"]
 
 
 def test_response_create_quotes_the_user_transcript() -> None:
@@ -64,10 +66,11 @@ def test_response_create_quotes_the_user_transcript() -> None:
     payload = build_response_create(settings, 'Vad är 5 plus 5?')
     text = payload["response"]["instructions"]
     assert "Vad är 5 plus 5?" in text
-    assert "Answer only that utterance" in text
+    assert "Svara bara på det" in text
+    assert "Upprepa inte frågan" in text
     assert "extremt kortfattat" in text
     bare = build_response_create(settings, "  ")
-    assert "Latest utterance" not in bare["response"]["instructions"]
+    assert "Senaste yttrandet" not in bare["response"]["instructions"]
 
 
 def test_realtime_url_is_the_documented_endpoint() -> None:

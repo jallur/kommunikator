@@ -43,7 +43,7 @@ Payload som relayn skickar:
 | Fält | Värde | Varför |
 | --- | --- | --- |
 | `voice` | `eve` (env `XAI_VOICE`) | Dokumenterat exempel. Listan hämtas med `GET /v1/tts/voices`. Ingen röst är påhittad. |
-| `instructions` | Du-form med guidens avsnittsordning. Svenska är primärt språk, inget norskt eller danskt inslag, engelska bara som inflikade ord, extremt kort svar. | Guiden säger att extra språk styrs i instruktionen, och att prompten ska ligga nära träningsformen. |
+| `instructions` | Svenska regler under guidens engelska avsnittsnamn. Primärt svenska, inget norskt eller danskt, engelska bara som inflikade ord, extremt kort, upprepa inte frågan. | Guiden säger att extra språk styrs i instruktionen, och att avsnittsnamnen ska ligga nära träningsformen. |
 | `turn_detection.type` | `null` | `input_audio_buffer.commit` finns bara när turn detection är null. PTT är den manuella vägen. |
 | `audio.input.format` | `audio/pcm`, 16000 | PCM-takter som dokumentationen listar: 8000, 16000, 22050, 24000, 32000, 44100, 48000. 16000 beskrivs som wideband, bra för tal. |
 | `audio.output.format` | `audio/pcm`, 24000 | 24000 är default och rekommenderad takt. |

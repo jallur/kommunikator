@@ -96,10 +96,10 @@ def build_response_create(settings: Settings, transcript: str) -> dict:
     quote = transcript.strip()
     if quote:
         instructions += (
-            "\n\n## Latest utterance\n"
-            "The user just said, verbatim: "
+            "\n\n## Senaste yttrandet\n"
+            "Personen sa precis, ordagrant: "
             + json.dumps(quote, ensure_ascii=False)
-            + "\nAnswer only that utterance. Do not answer an earlier question.\n"
+            + "\nSvara bara på det. Svara inte på en tidigare fråga. Upprepa inte frågan.\n"
         )
     return {"type": "response.create", "response": {"instructions": instructions}}
 
