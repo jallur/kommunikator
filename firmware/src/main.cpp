@@ -16,6 +16,7 @@
 #include <driver/i2s.h>
 #include <driver/rtc_io.h>
 #include <esp_heap_caps.h>
+#include <mbedtls/platform.h>
 
 #include <BluetoothA2DPSource.h>
 
@@ -752,7 +753,21 @@ extern "C" void kommOnArm() {
   closeReason[0] = 0;
 }
 
+// mbedTLS is built to allocate only from internal RAM. With classic
+// Bluetooth up, the two 16 KB SSL buffers do not fit. Large blocks go to
+// PSRAM; small ones stay internal for the crypto hardware.
+extern "C" void* kommTlsCalloc(size_t n, size_t size) {
+  size_t bytes = n * size;
+  void* p = nullptr;
+  if (bytes >= 2048) p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = heap_caps_calloc(n, size, MALLOC_CAP_8BIT);
+  return p;
+}
+
+extern "C" void kommTlsFree(void* p) { heap_caps_free(p); }
+
 static void logTls() {
+  Serial.printf("heap fri %u storst %u\n", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   if (!useTls) {
     Serial.printf("tls av %s:%u\n", relayHost.c_str(), (unsigned)relayPort);
     return;
@@ -1202,6 +1217,7 @@ void setup() {
   digitalWrite(PIN_HOLD, HIGH);
   Serial.begin(115200);
   delay(20);
+  mbedtls_platform_set_calloc_free(kommTlsCalloc, kommTlsFree);
 
   auto cfg = M5.config();
   cfg.fallback_board = m5::board_t::board_M5StickCPlus2;
