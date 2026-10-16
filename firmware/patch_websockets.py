@@ -18,6 +18,11 @@ ARM_NEW = (
     "    kommOnArm();\n"
     "    static const char * NEW_LINE = \"\\r\\n\";\n"
 )
+CONNECT_OLD = "        if(_client.tcp->connect(_host.c_str(), _port, WEBSOCKETS_TCP_TIMEOUT)) {\n"
+CONNECT_NEW = "        if(kommWsConnect(_client.tcp, _host.c_str(), _port, WEBSOCKETS_TCP_TIMEOUT)) {\n"
+CONNECT_DECL = (
+    'extern "C" int kommWsConnect(void* client, const char* host, uint16_t port, int32_t timeout);\n'
+)
 
 STATUS_OLD = (
     '            client->cCode = headerLine->substring(9, headerLine->indexOf(\' \', 9)).toInt();\n'
@@ -87,6 +92,7 @@ def patch_websockets(env, node):
     if name.endswith("/WebSocketsClient.cpp"):
         _patch(path, "kommOnStatus(", STATUS_OLD, STATUS_NEW, STATUS_DECL)
         _patch(path, "kommOnArm();", ARM_OLD, ARM_NEW, STATUS_DECL)
+        _patch(path, "kommWsConnect(", CONNECT_OLD, CONNECT_NEW, CONNECT_DECL)
     elif name.endswith("/WebSockets.cpp"):
         _patch(path, "kommOnClose(", CLOSE_OLD, CLOSE_NEW, CLOSE_DECL)
     elif name.endswith("/Mic_Class.cpp"):

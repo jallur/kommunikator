@@ -16,6 +16,7 @@
 #include <driver/i2s.h>
 #include <driver/rtc_io.h>
 #include <esp_heap_caps.h>
+#include <esp_a2dp_api.h>
 #include <esp_coexist.h>
 #include <mbedtls/platform.h>
 
@@ -268,6 +269,37 @@ static bool airpodsOn() {
   return a2dpState == ESP_A2D_CONNECTION_STATE_CONNECTED;
 }
 
+static bool a2dpMediaOn = false;
+static bool a2dpMediaWant = false;
+static IPAddress relayIp;
+static bool relayIpOk = false;
+
+static void onA2dpAudio(esp_a2d_audio_state_t audio, void*) {
+  a2dpMediaOn = audio == ESP_A2D_AUDIO_STATE_STARTED;
+  Serial.printf("bt ljud %d\n", static_cast<int>(audio));
+}
+
+static void setAirpodMedia(bool run) {
+  if (!airpodsOn()) return;
+  if (run == a2dpMediaWant && run == a2dpMediaOn) return;
+  if (!run && !a2dpMediaOn && !a2dpMediaWant) return;
+  esp_err_t err = esp_a2d_media_ctrl(run ? ESP_A2D_MEDIA_CTRL_START : ESP_A2D_MEDIA_CTRL_SUSPEND);
+  Serial.printf("bt media %s %d\n", run ? "start" : "paus", static_cast<int>(err));
+  if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) a2dpMediaWant = run;
+}
+
+static void cacheRelayIp(const char* host) {
+  if (relayIpOk || host == nullptr || host[0] == '\0') return;
+  IPAddress ip;
+  if (!WiFi.hostByName(host, ip) || static_cast<uint32_t>(ip) == 0) {
+    Serial.printf("dns miss %s\n", host);
+    return;
+  }
+  relayIp = ip;
+  relayIpOk = true;
+  Serial.printf("dns %s %s\n", host, ip.toString().c_str());
+}
+
 static uint8_t avrcpVolume() {
   return static_cast<uint8_t>((static_cast<uint16_t>(playVolume) * 127) / 255);
 }
@@ -345,16 +377,12 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
   constexpr unsigned long kGapMs = 250;
   if (!stereoRing || pttHeld || !airpodsOn()) {
     primed = false;
-    for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
-    return count;
+    return 0;
   }
   size_t have = stereoAvailFrames();
   bool ended = lastAudioMs != 0 && millis() - lastAudioMs > kGapMs;
   if (!primed) {
-    if (have == 0 || (have < kPrimeFrames && !ended)) {
-      for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
-      return count;
-    }
+    if (have == 0 || (have < kPrimeFrames && !ended)) return 0;
     primed = true;
   }
   size_t n = have < static_cast<size_t>(count) ? have : static_cast<size_t>(count);
@@ -364,7 +392,6 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
     int16_t sample = static_cast<int16_t>(stereoRing[o] | (static_cast<uint16_t>(stereoRing[o + 1]) << 8));
     frame[i].channel1 = frame[i].channel2 = sample;
   }
-  for (size_t i = n; i < static_cast<size_t>(count); i++) frame[i].channel1 = frame[i].channel2 = 0;
   if (n > 0) {
     size_t next = (r + n * 4) % kStereoBytes;
     portENTER_CRITICAL(&stMux);
@@ -373,7 +400,7 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
   } else if (ended) {
     primed = false;
   }
-  return count;
+  return static_cast<int32_t>(n);
 }
 
 static void releaseSpeaker();
@@ -384,6 +411,7 @@ static void startAirpods() {
   a2dp.set_local_name("Kommunikator");
   a2dp.set_ssid_callback(pickAirpod);
   a2dp.set_on_connection_state_changed(onA2dpConn, nullptr);
+  a2dp.set_on_audio_state_changed(onA2dpAudio, nullptr);
   a2dp.set_auto_reconnect(true);
   a2dp.set_ssp_enabled(true);
   a2dp.set_reset_ble(true);
@@ -397,6 +425,10 @@ static void serviceAirpods() {
   int prev = appliedA2dp;
   appliedA2dp = now;
   uiDirty = true;
+  if (now != ESP_A2D_CONNECTION_STATE_CONNECTED) {
+    a2dpMediaOn = false;
+    a2dpMediaWant = false;
+  }
   if (now == ESP_A2D_CONNECTION_STATE_CONNECTED) {
     Serial.printf("bt kopplad %s\n", a2dpName);
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
@@ -762,7 +794,10 @@ static void logWsEvent(WStype_t type, uint8_t* payload, size_t length) {
     return;
   }
   if (type == WStype_DISCONNECTED) {
-    Serial.printf("ws typ DISCONNECTED kod %u orsak %s\n", closeCode, closeReason);
+    int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+    Serial.printf("ws typ DISCONNECTED kod %u orsak %s rssi %d heap %u storst %u\n", closeCode,
+                  closeReason, rssi, static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(ESP.getMaxAllocHeap()));
     return;
   }
   if (type == WStype_BIN || type == WStype_FRAGMENT_BIN_START || type == WStype_PING || type == WStype_PONG) {
@@ -818,6 +853,22 @@ extern "C" void* kommTlsCalloc(size_t n, size_t size) {
 
 extern "C" void kommTlsFree(void* p) { heap_caps_free(p); }
 
+extern "C" int kommWsConnect(void* client, const char* host, uint16_t port, int32_t timeout) {
+  if (client == nullptr || host == nullptr) return 0;
+  if (!relayIpOk) cacheRelayIp(host);
+  if (relayIpOk && useTls) {
+    auto* secure = static_cast<WiFiClientSecure*>(client);
+    secure->setTimeout(static_cast<uint32_t>((timeout + 999) / 1000));
+    Serial.printf("ws ip %s\n", relayIp.toString().c_str());
+    return secure->connect(relayIp, port, host, KOMM_CA_CERT, nullptr, nullptr);
+  }
+  if (relayIpOk) {
+    Serial.printf("ws ip %s\n", relayIp.toString().c_str());
+    return static_cast<WiFiClient*>(client)->connect(relayIp, port, timeout);
+  }
+  return static_cast<WiFiClient*>(client)->connect(host, port, timeout);
+}
+
 static void logTls() {
   Serial.printf("heap fri %u storst %u\n", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   if (!useTls) {
@@ -845,6 +896,7 @@ static void startWebSocket() {
     return;
   }
   Serial.printf("wifi %s rssi %d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  cacheRelayIp(relayHost.c_str());
   logTls();
   // The library adds the trailing CRLF. One here would end the request early.
   snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s", deviceToken.c_str());
@@ -941,6 +993,7 @@ static void beginPtt() {
   pttHeld = true;
   capQueued = false;
   ringClear();
+  setAirpodMedia(false);
   esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
   M5.Speaker.stop();
   if (airpodsOn() && !useSpk2 && !M5.Speaker.isRunning()) startSpeaker();
@@ -971,7 +1024,6 @@ static void endPtt() {
   capQueued = false;
   M5.Mic.end();
   if (sessionReady) sendPtt("up");
-  if (airpodsOn()) esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   if (airpodsOn()) {
     if (!useSpk2) {
       if (!M5.Speaker.isRunning()) startSpeaker();
@@ -1311,11 +1363,15 @@ static void serviceSerial() {
 static void servicePlayback() {
   if (airpodsOn()) {
     if (!pttHeld && M5.Speaker.isRunning()) releaseSpeaker();
-    bool playing = stereoAvailFrames() > 0 || state == RunState::Speak;
-    static bool btPreferred = false;
-    if (playing != btPreferred) {
-      btPreferred = playing;
-      esp_coex_preference_set(playing ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_BALANCE);
+    size_t queued = stereoAvailFrames();
+    bool ready = queued >= 26460 || (queued > 0 && lastAudioMs != 0 && millis() - lastAudioMs > 250);
+    bool feed = !pttHeld && ready;
+    setAirpodMedia(feed);
+    static int coexMode = -1;
+    int want = feed ? 1 : 0;
+    if (want != coexMode) {
+      coexMode = want;
+      esp_coex_preference_set(want == 1 ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_WIFI);
     }
     if (state == RunState::Speak && stereoAvailFrames() == 0 && millis() - lastAudioMs > 200) {
       setState(RunState::Idle);
