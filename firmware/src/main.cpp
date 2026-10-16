@@ -308,10 +308,9 @@ static size_t ringPullSamples(int16_t* dest, size_t maxSamples) {
 // AirPods Pro 1 speak classic A2DP (SBC). Only the Plus2 profile has that
 // radio. StickS3 and CoreS3 Lite play on their own speaker.
 #if KOMM_A2DP
-// The library pages a saved address forever and never returns to inquiry.
-// A half-finished pair then blocks every later attempt. Two missed pages
-// open one search, then paging resumes so a bonded pair still reconnects
-// when the buds wake up.
+// The library pages a saved address on a 10 s heartbeat. Bonded AirPods do
+// not answer inquiry, so a search after the first miss just delays the
+// next page. Keep paging, and search only after a long streak of misses.
 static constexpr uint16_t kA2dpHeartBeat = 0xff00;
 
 class KommA2dp : public BluetoothA2DPSource {
@@ -328,14 +327,31 @@ class KommA2dp : public BluetoothA2DPSource {
     return esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
   }
 
+  // Already-paired AirPods answer a page and stay hidden from inquiry.
+  // The library only pages on a 10 s heartbeat, so call this from the loop.
+  void pageSaved() {
+    if (s_a2d_state != APP_AV_STATE_UNCONNECTED || !has_last_connection()) return;
+    memcpy(peer_bd_addr, last_connection, sizeof(esp_bd_addr_t));
+    s_a2d_state = APP_AV_STATE_CONNECTING;
+    esp_err_t err = esp_a2d_connect(peer_bd_addr);
+    if (err != ESP_OK) {
+      s_a2d_state = APP_AV_STATE_UNCONNECTED;
+      Serial.printf("bt anrop fel %d\n", static_cast<int>(err));
+      return;
+    }
+    Serial.println("bt anrop");
+  }
+
  protected:
   void bt_app_av_state_unconnected_hdlr(uint16_t event, void* param) override {
-    if (event == kA2dpHeartBeat && pageFails >= 1 && !pttHeld &&
+    // One search after a long run of missed pages, not after the first.
+    // A search cannot see buds that are only connectable.
+    if (event == kA2dpHeartBeat && pageFails >= 6 && !pttHeld &&
         state != RunState::Listen && state != RunState::Speak) {
       pageFails = 0;
       s_a2d_state = APP_AV_STATE_DISCOVERING;
       Serial.println("bt sok");
-      esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+      esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 4, 0);
       return;
     }
     if (event == kA2dpHeartBeat) pageFails++;
@@ -619,7 +635,16 @@ static void startAirpods() {
   logBtAddr("minne", *a2dp.get_last_peer_address());
 }
 
+static void serviceAirpodPage() {
+  if (!airpodsStarted || airpodsOn() || pttHeld || state == RunState::Listen) return;
+  static unsigned long last = 0;
+  if (millis() - last < 3000) return;
+  last = millis();
+  a2dp.pageSaved();
+}
+
 static void serviceAirpods() {
+  serviceAirpodPage();
   int now = a2dpState;
   if (now == appliedA2dp) return;
   int prev = appliedA2dp;
