@@ -16,6 +16,7 @@
 #include <driver/i2s.h>
 #include <driver/rtc_io.h>
 
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 
@@ -86,6 +87,14 @@ static uint8_t audioRing[kRingBytes];
 static size_t ringR = 0;
 static size_t ringW = 0;
 static unsigned long lastAudioMs = 0;
+static bool captureReplay = true;
+static uint8_t* replayBytes = nullptr;
+static size_t replayCap = 0;
+static size_t replayLen = 0;
+static uint8_t playVolume = 200;
+static uint32_t playClock = 48000;
+static uint8_t buzzerMag = 48;
+static uint8_t spk2Mag = 16;
 static portMUX_TYPE audioMux = portMUX_INITIALIZER_UNLOCKED;
 // Two of these sit in the speaker queue. 512 samples is 32 ms at 16 kHz,
 // so one screen redraw cannot empty the queue.
@@ -159,9 +168,22 @@ static void ringClear() {
   portEXIT_CRITICAL(&audioMux);
 }
 
+static void replayAppend(const uint8_t* data, size_t len) {
+  if (!replayBytes || replayCap < 2) return;
+  if (lastAudioMs != 0 && millis() - lastAudioMs > 200) replayLen = 0;
+  if (replayLen >= replayCap) return;
+  size_t room = replayCap - replayLen;
+  if (len > room) len = room;
+  len &= ~size_t{1};
+  if (!len) return;
+  memcpy(replayBytes + replayLen, data, len);
+  replayLen += len;
+}
+
 static void ringPush(const uint8_t* data, size_t len) {
   if (len < 2) return;
   len &= ~size_t{1};
+  if (captureReplay) replayAppend(data, len);
   portENTER_CRITICAL(&audioMux);
   for (size_t i = 0; i < len; i += 2) {
     while (ringCountHeld() >= kRingBytes - 2) ringR = (ringR + 2) % kRingBytes;
@@ -215,7 +237,7 @@ static bool startSpeaker() {
     cfg.buzzer = false;
     cfg.use_dac = false;
     cfg.i2s_port = I2S_NUM_1;
-    cfg.magnification = 16;
+    cfg.magnification = spk2Mag;
   } else {
     cfg.pin_data_out = PIN_BUZZER;
     cfg.pin_bck = I2S_PIN_NO_CHANGE;
@@ -223,15 +245,15 @@ static bool startSpeaker() {
     cfg.buzzer = true;
     cfg.use_dac = false;
     cfg.i2s_port = I2S_NUM_1;
-    cfg.magnification = 48;
+    cfg.magnification = buzzerMag;
   }
   cfg.stereo = false;
   // The buzzer is a 1-bit modulator. Its I2S clock has to stay fast or the
   // bitstream collapses into noise. playRaw still hands over 16 kHz PCM.
-  cfg.sample_rate = 48000;
+  cfg.sample_rate = playClock;
   cfg.task_priority = 3;
   M5.Speaker.config(cfg);
-  M5.Speaker.setVolume(200);
+  M5.Speaker.setVolume(playVolume);
   bool ok = M5.Speaker.begin();
   speakerI2sLive = ok;
   if (!ok && useSpk2) {
@@ -826,6 +848,144 @@ static void serviceCapture() {
   capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
 }
 
+static void printAudio() {
+  uint8_t mag = useSpk2 ? spk2Mag : buzzerMag;
+  Serial.printf("ljud v=%u klocka=%u mag=%u sparat=%u\n", playVolume, playClock, mag,
+                (unsigned)(replayLen / 2));
+}
+
+static bool audioBusy() { return pttHeld; }
+
+static void playSaved() {
+  if (audioBusy()) {
+    Serial.println("ljud upptagen");
+    return;
+  }
+  if (replayLen < 2) {
+    Serial.println("ljud inget sparat");
+    return;
+  }
+  if (!M5.Speaker.isRunning()) startSpeaker();
+  captureReplay = false;
+  ringClear();
+  ringPush(replayBytes, replayLen);
+  captureReplay = true;
+  Serial.println("ljud spelar senaste");
+}
+
+static void playTone() {
+  if (audioBusy()) {
+    Serial.println("ljud upptagen");
+    return;
+  }
+  if (!M5.Speaker.isRunning()) startSpeaker();
+  captureReplay = false;
+  ringClear();
+  int16_t chunk[128];
+  const int total = 16000;
+  for (int i = 0; i < total;) {
+    int n = 128;
+    if (i + n > total) n = total - i;
+    for (int s = 0; s < n; s++) {
+      int t = i + s;
+      float v;
+      if (t < 3200) {
+        v = sinf(t * 6.2831853f * 440.0f / 16000.0f);
+      } else {
+        float phase = t * 6.2831853f * 180.0f / 16000.0f;
+        v = sinf(phase) * 0.55f + sinf(phase * 2.0f) * 0.3f + sinf(phase * 3.0f) * 0.15f;
+      }
+      int sample = static_cast<int>(v * 10000.0f);
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+      chunk[s] = static_cast<int16_t>(sample);
+    }
+    ringPush(reinterpret_cast<uint8_t*>(chunk), static_cast<size_t>(n) * 2);
+    i += n;
+  }
+  captureReplay = true;
+  Serial.println("ljud ton");
+}
+
+static int cmdInt(const char* text, int fallback) {
+  while (*text == ' ') text++;
+  if (*text == '\0') return fallback;
+  return atoi(text);
+}
+
+static void handleAudioCmd(char* line) {
+  while (*line == ' ') line++;
+  if (*line == '\0') return;
+  char op = line[0];
+  const char* arg = line + 1;
+  if (op == 't') {
+    playTone();
+    printAudio();
+    return;
+  }
+  if (op == 'p') {
+    playSaved();
+    printAudio();
+    return;
+  }
+  if (op == 'v') {
+    int volume = cmdInt(arg, -1);
+    if (volume < 0 || volume > 255) {
+      Serial.println("ljud v 0-255");
+      return;
+    }
+    playVolume = static_cast<uint8_t>(volume);
+    if (M5.Speaker.isRunning()) M5.Speaker.setVolume(playVolume);
+    printAudio();
+    return;
+  }
+  if (op == 'r') {
+    int rate = cmdInt(arg, -1);
+    if (rate != 16000 && rate != 22050 && rate != 24000 && rate != 32000 && rate != 44100 &&
+        rate != 48000) {
+      Serial.println("ljud r 16000|22050|24000|32000|44100|48000");
+      return;
+    }
+    playClock = static_cast<uint32_t>(rate);
+    if (!audioBusy()) startSpeaker();
+    printAudio();
+    return;
+  }
+  if (op == 'm') {
+    int mag = cmdInt(arg, -1);
+    if (mag < 1 || mag > 64) {
+      Serial.println("ljud m 1-64");
+      return;
+    }
+    if (useSpk2) spk2Mag = static_cast<uint8_t>(mag);
+    else buzzerMag = static_cast<uint8_t>(mag);
+    if (!audioBusy()) startSpeaker();
+    printAudio();
+    return;
+  }
+  Serial.println("ljud: t ton, p senaste, v 0-255, r takt, m 1-64, ?");
+  printAudio();
+}
+
+static char cmdLine[32];
+static uint8_t cmdLen = 0;
+
+static void serviceSerial() {
+  while (Serial.available() > 0) {
+    int raw = Serial.read();
+    if (raw < 0) return;
+    char c = static_cast<char>(raw);
+    if (c == '\r' || c == '\n') {
+      if (cmdLen == 0) continue;
+      cmdLine[cmdLen] = '\0';
+      cmdLen = 0;
+      handleAudioCmd(cmdLine);
+      continue;
+    }
+    if (cmdLen < sizeof(cmdLine) - 1) cmdLine[cmdLen++] = c;
+  }
+}
+
 static void servicePlayback() {
   if (pttHeld || !M5.Speaker.isRunning()) return;
   // Keep both speaker slots full. A half-empty queue runs dry while the
@@ -898,6 +1058,16 @@ void setup() {
   speakerI2sLive = cfg.internal_spk || useSpk2;
   startSpeaker();
   M5.Mic.end();
+  replayCap = 32 * 1024;
+  replayBytes = static_cast<uint8_t*>(malloc(replayCap));
+  if (!replayBytes) {
+    replayCap = 12 * 1024;
+    replayBytes = static_cast<uint8_t*>(malloc(replayCap));
+  }
+  if (!replayBytes) replayCap = 0;
+  Serial.printf("ljud replay %u byte\n", static_cast<unsigned>(replayCap));
+  Serial.println("ljud: t ton, p senaste, v 0-255, r takt, m 1-64, ?");
+  printAudio();
   markActivity();
 
   M5.update();
@@ -909,6 +1079,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  serviceSerial();
   if (state == RunState::Provision) {
     dns.processNextRequest();
     portal.handleClient();

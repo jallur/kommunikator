@@ -56,7 +56,7 @@ Push-to-talk:
 
 1. Knapp ned: enheten strömmar PCM medan knappen är nedtryckt. Relayn skickar binära frames vidare till xAI (`input_audio_buffer.append` behövs inte i binary-läge; råa frames är append).
 2. Om ett svar redan spelas skickar relayn `response.cancel`. Det är dokumenterat för manuell avbrytning när VAD är av.
-3. Knapp upp: om minst en sample skickats, `input_audio_buffer.commit` och sedan `response.create`. Tomt tryck committas inte. Med server VAD hade `response.create` varit automatiskt. Här är det manuellt.
+3. Knapp upp: om minst en sample skickats, `input_audio_buffer.commit`. Relayn väntar på den färdiga användartexten (högst 2,5 s) och skickar sedan `response.create` med den texten citerad, så röstmodellen svarar på den frågan och inte på en tidigare. Tomt tryck committas inte. Knapp ned skickar `input_audio_buffer.clear`. Med server VAD hade `response.create` varit automatiskt. Här är det manuellt.
 4. Svarsljud kommer som binära frames. Text kommer som JSON.
 
 Latens: enheten väntar inte in hela yttrandet innan den skickar. 20 ms-block (320 samples vid 16 kHz) går upp medan man pratar. Relayn resamplar och skriver vidare utan att buffra ett yttrande.
@@ -70,6 +70,8 @@ Relayn resamplar till `XAI_INPUT_RATE` (default 16000). Lika takt är en kopia. 
 Ned: xAI PCM16 vid `XAI_OUTPUT_RATE` (default 24000) → relayn resamplar till den takt enheten anmälde i `hello.playback_rate` (firmware: 16000) → binär frame → den inbyggda summern. Hat SPK2 är av tills knapp B hålls inne.
 
 Summern är en 1-bitsmodulator. I2S-klockan ligger på 48 kHz, medan `playRaw` fortfarande får 16 kHz, så M5Unified samplar upp. Ringen är 56 KB och släpper bara hela samples. Två ljudbuffertar på 32 ms vardera ligger i kön så en skärmritning inte hinner tysta talet.
+
+Serieporten tar ljudkommandon, en rad per tryck på retur (`pio device monitor -f send_on_enter`). `t` spelar en sekunds ton genom samma väg som svaret. `p` spelar senaste mottagna svaret igen, utan nytt anrop till xAI. `v` sätter volym 0–255, `r` sätter I2S-klockan, `m` sätter förstärkning 1–64. Stickan svarar `ljud v=… klocka=… mag=…`.
 
 Båda takterna måste vara en dokumenterad PCM-takt. 11025 och andra gissningar avvisas.
 
