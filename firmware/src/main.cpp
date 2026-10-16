@@ -19,6 +19,8 @@
 #include <esp_a2dp_api.h>
 #include <esp_coexist.h>
 #include <mbedtls/platform.h>
+#include <fcntl.h>
+#include <sys/socket.h>
 
 #include <BluetoothA2DPSource.h>
 
@@ -67,7 +69,16 @@ static volatile bool pttHeld = false;
 static bool wsStarted = false;
 static bool speakerI2sLive = false;
 static bool capQueued = false;
+static bool capLive = false;
+static bool capWarned = false;
+static uint32_t capQueuedMs = 0;
 static int16_t capBuf[CAPTURE_SAMPLES];
+// The listen path used to block inside a socket write or Mic.record(). Button
+// edges are only sampled from loop(), so the stick then sat on LYSSNAR.
+static volatile int wsFd = -1;
+static volatile uint32_t loopMs = 0;
+static volatile uint8_t wantAbort = 0;
+static volatile bool listenLive = false;
 static volatile bool uiDirty = true;
 
 static String wifiSsid;
@@ -437,11 +448,13 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
 static void logAudio(const char* why) {
   unsigned age = lastAudioMs == 0 ? 0u : static_cast<unsigned>(millis() - lastAudioMs);
   Serial.printf(
-      "ljud %s mono %u stereo %u ut %u tom %u tapS %u tapM %u media %d/%d ptt %d alder %u %s\n",
+      "ljud %s mono %u stereo %u ut %u tom %u tapS %u tapM %u media %d/%d ptt %d btn %d mic %u alder %u %s\n",
       why, static_cast<unsigned>(ringAvailSamples()), static_cast<unsigned>(stereoAvailFrames()),
       static_cast<unsigned>(fillOutFrames), static_cast<unsigned>(fillEmptyCalls),
       static_cast<unsigned>(stereoDropFrames), static_cast<unsigned>(monoDropSamples),
-      a2dpMediaOn ? 1 : 0, a2dpMediaWant ? 1 : 0, pttHeld ? 1 : 0, age, stateName(state));
+      a2dpMediaOn ? 1 : 0, a2dpMediaWant ? 1 : 0, pttHeld ? 1 : 0,
+      gpio_get_level(static_cast<gpio_num_t>(PIN_BTN_A)) == 0 ? 1 : 0,
+      static_cast<unsigned>(M5.Mic.isRecording()), age, stateName(state));
 }
 
 static void releaseSpeaker();
@@ -540,11 +553,14 @@ static bool startMic() {
   cfg.sample_rate = CAPTURE_HZ;
   cfg.use_adc = false;
   cfg.stereo = false;
-  cfg.i2s_port = I2S_NUM_0;
+  // I2S0 is the port the ESP32 Bluetooth controller can hold. The speaker
+  // is already stopped here, so the mic takes I2S1 and cannot stall behind it.
+  cfg.i2s_port = I2S_NUM_1;
   cfg.over_sampling = 2;
   cfg.magnification = 16;
   cfg.dma_buf_len = 128;
-  cfg.task_priority = 2;
+  cfg.task_priority = 1;
+  cfg.task_pinned_core = 0;
   M5.Mic.config(cfg);
   return M5.Mic.begin();
 }
@@ -761,6 +777,7 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
       sendHello();
       break;
     case WStype_DISCONNECTED:
+      wsFd = -1;
       sessionReady = false;
       if (state != RunState::Provision && state != RunState::Wifi) {
         detailLine = "bruten lank";
@@ -898,20 +915,66 @@ extern "C" void* kommTlsCalloc(size_t n, size_t size) {
 
 extern "C" void kommTlsFree(void* p) { heap_caps_free(p); }
 
+static void clampSocket(int fd) {
+  if (fd < 0) return;
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  struct timeval tv;
+  tv.tv_sec = 0;
+  tv.tv_usec = 250000;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+extern "C" void kommClampWs(void* client) {
+  if (client == nullptr) return;
+  int fd = useTls ? static_cast<WiFiClientSecure*>(client)->fd() : static_cast<WiFiClient*>(client)->fd();
+  wsFd = fd;
+  clampSocket(fd);
+}
+
+static bool wsCanSend() {
+  int fd = wsFd;
+  if (fd < 0) return false;
+  fd_set set;
+  FD_ZERO(&set);
+  FD_SET(fd, &set);
+  struct timeval tv;
+  tv.tv_sec = 0;
+  tv.tv_usec = 0;
+  return select(fd + 1, nullptr, &set, nullptr, &tv) > 0;
+}
+
 extern "C" int kommWsConnect(void* client, const char* host, uint16_t port, int32_t timeout) {
   if (client == nullptr || host == nullptr) return 0;
   if (!relayIpOk) cacheRelayIp(host);
+  int ok = 0;
+  int fd = -1;
   if (relayIpOk && useTls) {
     auto* secure = static_cast<WiFiClientSecure*>(client);
-    secure->setTimeout(static_cast<uint32_t>((timeout + 999) / 1000));
+    // Seconds, and only for the TCP+TLS connect. The library later calls
+    // setTimeout(WEBSOCKETS_TCP_TIMEOUT) and would treat that as seconds.
+    secure->setTimeout(8);
     Serial.printf("ws ip %s\n", relayIp.toString().c_str());
-    return secure->connect(relayIp, port, host, KOMM_CA_CERT, nullptr, nullptr);
-  }
-  if (relayIpOk) {
+    ok = secure->connect(relayIp, port, host, KOMM_CA_CERT, nullptr, nullptr);
+    if (ok) fd = secure->fd();
+  } else if (relayIpOk) {
     Serial.printf("ws ip %s\n", relayIp.toString().c_str());
-    return static_cast<WiFiClient*>(client)->connect(relayIp, port, timeout);
+    auto* plain = static_cast<WiFiClient*>(client);
+    ok = plain->connect(relayIp, port, timeout);
+    if (ok) fd = plain->fd();
+  } else {
+    auto* plain = static_cast<WiFiClient*>(client);
+    ok = plain->connect(host, port, timeout);
+    if (ok) fd = plain->fd();
   }
-  return static_cast<WiFiClient*>(client)->connect(host, port, timeout);
+  if (ok) {
+    wsFd = fd;
+    clampSocket(fd);
+  } else {
+    wsFd = -1;
+  }
+  return ok;
 }
 
 static void logTls() {
@@ -1036,7 +1099,10 @@ static void beginWifi() {
 static void beginPtt() {
   if (state == RunState::Provision || state == RunState::Wifi) return;
   pttHeld = true;
+  listenLive = true;
   capQueued = false;
+  capLive = false;
+  capWarned = false;
   ringClear();
   setAirpodMedia(false);
   esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
@@ -1053,6 +1119,7 @@ static void beginPtt() {
   if (!startMic()) {
     detailLine = "mic";
     pttHeld = false;
+    listenLive = false;
     if (!airpodsOn()) startSpeaker();
     setState(RunState::Error);
     return;
@@ -1072,6 +1139,7 @@ static void abortActivity() {
   bool wasPtt = pttHeld;
   pttHeld = false;
   capQueued = false;
+  capLive = false;
   M5.Mic.end();
   M5.Speaker.stop();
   ringClear();
@@ -1084,6 +1152,7 @@ static void abortActivity() {
   setState(sessionReady ? RunState::Idle : RunState::Connecting);
   uiDirty = true;
   markActivity();
+  listenLive = false;
   Serial.println("avbryt");
   logAudio("avbryt");
 }
@@ -1092,6 +1161,7 @@ static void endPtt() {
   if (!pttHeld) return;
   pttHeld = false;
   capQueued = false;
+  capLive = false;
   M5.Mic.end();
   if (sessionReady) sendPtt("up");
   if (airpodsOn()) {
@@ -1110,6 +1180,7 @@ static void endPtt() {
     chirp(true);
   }
   setState(sessionReady ? RunState::Think : RunState::Idle);
+  listenLive = false;
   markActivity();
 }
 
@@ -1285,13 +1356,33 @@ static void serviceCapture() {
     return;
   }
   if (!capQueued) {
+    capLive = false;
+    capWarned = false;
+    capQueuedMs = millis();
     capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
+    if (!capQueued) Serial.println("mic ko");
     return;
   }
   // record() returns as soon as the buffer is queued. Sending it then lets
-  // the mic task write into a dead stack frame and panics core 1.
-  if (M5.Mic.isRecording()) return;
+  // the mic task write into a dead stack frame and panics core 1. isRecording()
+  // is also 0 for a moment before the task starts; calling record() again then
+  // spins on the main loop until that buffer finishes, which is how LYSSNAR froze.
+  if (M5.Mic.isRecording()) {
+    capLive = true;
+    return;
+  }
+  if (!capLive) {
+    if (!capWarned && millis() - capQueuedMs > 400) {
+      capWarned = true;
+      Serial.println("mic tyst");
+    }
+    return;
+  }
+  if (!wsCanSend()) return;
   webSocket.sendBIN(reinterpret_cast<uint8_t*>(capBuf), sizeof(capBuf));
+  capLive = false;
+  capWarned = false;
+  capQueuedMs = millis();
   capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
 }
 
@@ -1569,6 +1660,29 @@ void setup() {
   startAirpods();
 
   M5.update();
+  xTaskCreatePinnedToCore(
+      [](void*) {
+        uint8_t high = 0;
+        uint32_t cutAt = 0;
+        for (;;) {
+          bool live = listenLive;
+          int released = gpio_get_level(static_cast<gpio_num_t>(PIN_BTN_A)) != 0;
+          int power = gpio_get_level(GPIO_NUM_35) == 0;
+          if (!live || !released) high = 0;
+          else if (++high >= 2) wantAbort = 1;
+          if (live && power) wantAbort = 2;
+          uint32_t beat = loopMs;
+          bool stalled = beat != 0 && millis() - beat > 700;
+          if (live && stalled && (released || power) && cutAt != beat) {
+            cutAt = beat;
+            int fd = wsFd;
+            if (fd >= 0) shutdown(fd, SHUT_RDWR);
+            Serial.println("vakt lossar");
+          }
+          vTaskDelay(pdMS_TO_TICKS(20));
+        }
+      },
+      "vakt", 3072, nullptr, 5, nullptr, 0);
   bool forcePortal = M5.BtnB.isPressed() || wifiSsid.length() == 0;
   if (forcePortal) enterProvision();
   else beginWifi();
@@ -1576,8 +1690,18 @@ void setup() {
 }
 
 void loop() {
+  loopMs = millis();
   M5.update();
   serviceSerial();
+  if (wantAbort && listenLive) {
+    uint8_t why = wantAbort;
+    wantAbort = 0;
+    if (why == 2) abortActivity();
+    else if (pttHeld) {
+      Serial.println("ptt upp");
+      endPtt();
+    }
+  }
   if (state == RunState::Provision) {
     dns.processNextRequest();
     portal.handleClient();
