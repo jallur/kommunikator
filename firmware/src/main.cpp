@@ -860,7 +860,9 @@ static void enterProvision() {
 static void beginWifi() {
   setState(RunState::Wifi);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  // Classic Bluetooth and Wi-Fi share the radio. The IDF aborts if modem
+  // sleep is off while both are enabled.
+  WiFi.setSleep(true);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   uiDirty = true;
 }
