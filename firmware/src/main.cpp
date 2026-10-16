@@ -78,11 +78,19 @@ static int batteryMv = 0;
 static unsigned long lastActivity = 0;
 static unsigned long lastBatteryMs = 0;
 
-static uint8_t audioRing[24 * 1024];
-static uint16_t ringR = 0;
-static uint16_t ringW = 0;
+// 24 KB held under a second, and a full ring used to drop a single byte, so
+// every later sample was swapped and the buzzer turned into noise. 56 KB is
+// what still fits in DRAM: about 1.7 s. Past that, whole samples are dropped.
+static constexpr size_t kRingBytes = 56 * 1024;
+static uint8_t audioRing[kRingBytes];
+static size_t ringR = 0;
+static size_t ringW = 0;
+static unsigned long lastAudioMs = 0;
 static portMUX_TYPE audioMux = portMUX_INITIALIZER_UNLOCKED;
-static int16_t playBuf[3][256];
+// Two of these sit in the speaker queue. 512 samples is 32 ms at 16 kHz,
+// so one screen redraw cannot empty the queue.
+static constexpr size_t kPlaySamples = 512;
+static int16_t playBuf[3][kPlaySamples];
 static uint8_t playIdx = 0;
 
 static const char* stateName(RunState value) {
@@ -140,6 +148,10 @@ static void foldUtf8(String& out, const char* utf8, size_t limit) {
 
 static void markActivity() { lastActivity = millis(); }
 
+static size_t ringCountHeld() {
+  return (ringW + kRingBytes - ringR) % kRingBytes;
+}
+
 static void ringClear() {
   portENTER_CRITICAL(&audioMux);
   ringR = 0;
@@ -148,27 +160,36 @@ static void ringClear() {
 }
 
 static void ringPush(const uint8_t* data, size_t len) {
+  if (len < 2) return;
+  len &= ~size_t{1};
   portENTER_CRITICAL(&audioMux);
-  for (size_t i = 0; i < len; i++) {
-    uint16_t next = static_cast<uint16_t>((ringW + 1) % sizeof(audioRing));
-    if (next == ringR) break;
+  for (size_t i = 0; i < len; i += 2) {
+    while (ringCountHeld() >= kRingBytes - 2) ringR = (ringR + 2) % kRingBytes;
     audioRing[ringW] = data[i];
-    ringW = next;
+    ringW = (ringW + 1) % kRingBytes;
+    audioRing[ringW] = data[i + 1];
+    ringW = (ringW + 1) % kRingBytes;
   }
   portEXIT_CRITICAL(&audioMux);
+  lastAudioMs = millis();
+}
+
+static size_t ringAvailSamples() {
+  portENTER_CRITICAL(&audioMux);
+  size_t n = ringCountHeld() / 2;
+  portEXIT_CRITICAL(&audioMux);
+  return n;
 }
 
 static size_t ringPullSamples(int16_t* dest, size_t maxSamples) {
   size_t got = 0;
   portENTER_CRITICAL(&audioMux);
-  while (got < maxSamples) {
-    uint16_t available = static_cast<uint16_t>((ringW + sizeof(audioRing) - ringR) % sizeof(audioRing));
-    if (available < 2) break;
+  while (got < maxSamples && ringCountHeld() >= 2) {
     uint8_t lo = audioRing[ringR];
-    ringR = static_cast<uint16_t>((ringR + 1) % sizeof(audioRing));
+    ringR = (ringR + 1) % kRingBytes;
     uint8_t hi = audioRing[ringR];
-    ringR = static_cast<uint16_t>((ringR + 1) % sizeof(audioRing));
-    dest[got++] = static_cast<int16_t>(lo | (hi << 8));
+    ringR = (ringR + 1) % kRingBytes;
+    dest[got++] = static_cast<int16_t>(lo | (static_cast<uint16_t>(hi) << 8));
   }
   portEXIT_CRITICAL(&audioMux);
   return got;
@@ -205,7 +226,10 @@ static bool startSpeaker() {
     cfg.magnification = 48;
   }
   cfg.stereo = false;
-  cfg.sample_rate = PLAYBACK_HZ;
+  // The buzzer is a 1-bit modulator. Its I2S clock has to stay fast or the
+  // bitstream collapses into noise. playRaw still hands over 16 kHz PCM.
+  cfg.sample_rate = 48000;
+  cfg.task_priority = 3;
   M5.Speaker.config(cfg);
   M5.Speaker.setVolume(200);
   bool ok = M5.Speaker.begin();
@@ -804,12 +828,23 @@ static void serviceCapture() {
 
 static void servicePlayback() {
   if (pttHeld || !M5.Speaker.isRunning()) return;
-  if (M5.Speaker.isPlaying(0) >= 2) return;
-  size_t n = ringPullSamples(playBuf[playIdx], 256);
-  if (n == 0) return;
-  M5.Speaker.playRaw(playBuf[playIdx], n, PLAYBACK_HZ, false, 1, 0, false);
-  playIdx = static_cast<uint8_t>((playIdx + 1) % 3);
-  setState(RunState::Speak);
+  // Keep both speaker slots full. A half-empty queue runs dry while the
+  // screen redraws, which is the short silence in the middle of a reply.
+  while (M5.Speaker.isPlaying(0) < 2) {
+    size_t avail = ringAvailSamples();
+    bool stale = millis() - lastAudioMs > 60;
+    if (avail < kPlaySamples && !(stale && avail > 0)) break;
+    size_t want = avail < kPlaySamples ? avail : kPlaySamples;
+    size_t n = ringPullSamples(playBuf[playIdx], want);
+    if (n == 0) break;
+    M5.Speaker.playRaw(playBuf[playIdx], n, PLAYBACK_HZ, false, 1, 0, false);
+    playIdx = static_cast<uint8_t>((playIdx + 1) % 3);
+    setState(RunState::Speak);
+  }
+  if (state == RunState::Speak && ringAvailSamples() == 0 && M5.Speaker.isPlaying(0) == 0 &&
+      millis() - lastAudioMs > 120) {
+    setState(RunState::Idle);
+  }
 }
 
 static void maybeSleep() {
@@ -912,5 +947,8 @@ void loop() {
     }
   }
   maybeSleep();
-  if (uiDirty) draw();
+  if (uiDirty) {
+    servicePlayback();
+    draw();
+  }
 }

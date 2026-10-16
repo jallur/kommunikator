@@ -69,6 +69,8 @@ Relayn resamplar till `XAI_INPUT_RATE` (default 16000). Lika takt är en kopia. 
 
 Ned: xAI PCM16 vid `XAI_OUTPUT_RATE` (default 24000) → relayn resamplar till den takt enheten anmälde i `hello.playback_rate` (firmware: 16000) → binär frame → den inbyggda summern. Hat SPK2 är av tills knapp B hålls inne.
 
+Summern är en 1-bitsmodulator. I2S-klockan ligger på 48 kHz, medan `playRaw` fortfarande får 16 kHz, så M5Unified samplar upp. Ringen är 56 KB och släpper bara hela samples. Två ljudbuffertar på 32 ms vardera ligger i kön så en skärmritning inte hinner tysta talet.
+
 Båda takterna måste vara en dokumenterad PCM-takt. 11025 och andra gissningar avvisas.
 
 SPK2 (MAX98357) på Stick-hatten, från M5:s exempel och M5Unified:
