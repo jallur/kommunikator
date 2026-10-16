@@ -308,7 +308,46 @@ static size_t ringPullSamples(int16_t* dest, size_t maxSamples) {
 // AirPods Pro 1 speak classic A2DP (SBC). Only the Plus2 profile has that
 // radio. StickS3 and CoreS3 Lite play on their own speaker.
 #if KOMM_A2DP
-static BluetoothA2DPSource a2dp;
+// The library pages a saved address forever and never returns to inquiry.
+// A half-finished pair then blocks every later attempt. Two missed pages
+// open one search, then paging resumes so a bonded pair still reconnects
+// when the buds wake up.
+static constexpr uint16_t kA2dpHeartBeat = 0xff00;
+
+class KommA2dp : public BluetoothA2DPSource {
+ public:
+  int pageFails = 0;
+
+  void noteConnected() { pageFails = 0; }
+
+ protected:
+  void bt_app_av_state_unconnected_hdlr(uint16_t event, void* param) override {
+    if (event == kA2dpHeartBeat && pageFails >= 1 && !pttHeld &&
+        state != RunState::Listen && state != RunState::Speak) {
+      pageFails = 0;
+      s_a2d_state = APP_AV_STATE_DISCOVERING;
+      Serial.println("bt sok");
+      esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+      return;
+    }
+    if (event == kA2dpHeartBeat) pageFails++;
+    BluetoothA2DPSource::bt_app_av_state_unconnected_hdlr(event, param);
+  }
+
+  void bt_app_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) override {
+    if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT &&
+        param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED &&
+        s_a2d_state != APP_AV_STATE_DISCOVERED) {
+      Serial.println("bt ingen ny");
+      s_a2d_state = APP_AV_STATE_UNCONNECTED;
+      pageFails = 0;
+      return;
+    }
+    BluetoothA2DPSource::bt_app_gap_callback(event, param);
+  }
+};
+
+static KommA2dp a2dp;
 static volatile int a2dpState = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
 static int appliedA2dp = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
 static char a2dpName[48] = "";
@@ -396,18 +435,41 @@ static bool containsAirpod(const char* name) {
   return strstr(buf, "airpod") != nullptr;
 }
 
-static bool pickAirpod(const char* name, esp_bd_addr_t, int rssi) {
+static void rememberAirpodName(const char* name) {
+  if (name == nullptr || name[0] == '\0') return;
+  strncpy(a2dpName, name, sizeof(a2dpName) - 1);
+  a2dpName[sizeof(a2dpName) - 1] = '\0';
+  prefs.putString("airname", a2dpName);
+}
+
+static void logBtAddr(const char* why, const uint8_t* mac) {
+  bool any = false;
+  if (mac != nullptr) {
+    for (int i = 0; i < 6; i++) {
+      if (mac[i] != 0) any = true;
+    }
+  }
+  if (!any) {
+    Serial.printf("bt %s ingen\n", why);
+    return;
+  }
+  Serial.printf("bt %s %02x:%02x:%02x:%02x:%02x:%02x\n", why, mac[0], mac[1], mac[2], mac[3],
+                mac[4], mac[5]);
+}
+
+static bool pickAirpod(const char* name, esp_bd_addr_t address, int rssi) {
   if (name == nullptr || name[0] == '\0') return false;
   Serial.printf("bt namn %s rssi %d\n", name, rssi);
   if (!containsAirpod(name)) return false;
-  strncpy(a2dpName, name, sizeof(a2dpName) - 1);
-  a2dpName[sizeof(a2dpName) - 1] = '\0';
+  rememberAirpodName(name);
+  logBtAddr("val", address);
   Serial.printf("bt val %s\n", a2dpName);
   return true;
 }
 
-static void onA2dpConn(esp_a2d_connection_state_t state, void*) {
-  a2dpState = static_cast<int>(state);
+static void onA2dpConn(esp_a2d_connection_state_t link, void*) {
+  a2dpState = static_cast<int>(link);
+  if (link == ESP_A2D_CONNECTION_STATE_CONNECTED) a2dp.noteConnected();
   uiDirty = true;
   Serial.printf("bt lage %d\n", a2dpState);
 }
@@ -510,7 +572,7 @@ static bool airpodsStarted = false;
 
 #if KOMM_A2DP
 static void startAirpods() {
-  Serial.println("bt start, satt AirPods i parning");
+  Serial.println("bt start");
   a2dp.set_local_name("Kommunikator");
   a2dp.set_ssid_callback(pickAirpod);
   a2dp.set_on_connection_state_changed(onA2dpConn, nullptr);
@@ -520,6 +582,11 @@ static void startAirpods() {
   a2dp.set_reset_ble(true);
   a2dp.set_volume(avrcpVolume());
   a2dp.start(fillAirpods);
+  // The library claims a display and a yes/no key. AirPods have neither, so
+  // the pair stalls. Just Works lets the bond complete on its own.
+  esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+  esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(iocap));
+  logBtAddr("minne", *a2dp.get_last_peer_address());
 }
 
 static void serviceAirpods() {
@@ -1517,6 +1584,13 @@ static void loadConfig() {
     if (nvs_get_u8(handle, "spk2", &flag) == ESP_OK) useSpk2 = flag != 0;
     nvs_close(handle);
   }
+#if KOMM_A2DP
+  String airName = prefs.getString("airname", "");
+  if (airName.length() > 0) {
+    strncpy(a2dpName, airName.c_str(), sizeof(a2dpName) - 1);
+    a2dpName[sizeof(a2dpName) - 1] = '\0';
+  }
+#endif
   playVolume = prefs.getUChar("vol", playVolume);
   screenBright = prefs.getUChar("bright", screenBright);
 #ifdef KOMM_WIFI_SSID
@@ -1785,6 +1859,8 @@ static void setupValue(int row, char* buf, size_t n) {
     snprintf(buf, n, "%s", a2dpName);
   } else if (airpodsOn()) {
     snprintf(buf, n, "kopplad");
+  } else if (a2dpName[0]) {
+    snprintf(buf, n, "%s", a2dpName);
   } else {
     snprintf(buf, n, "inga");
   }

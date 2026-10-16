@@ -15,7 +15,40 @@
 
 static const int PIN_HOLD = 4;
 
-static BluetoothA2DPSource a2dp;
+// Two missed pages open one search, then paging of the saved address resumes.
+static constexpr uint16_t kA2dpHeartBeat = 0xff00;
+
+class KommA2dp : public BluetoothA2DPSource {
+ public:
+  int pageFails = 0;
+
+ protected:
+  void bt_app_av_state_unconnected_hdlr(uint16_t event, void* param) override {
+    if (event == kA2dpHeartBeat && pageFails >= 1) {
+      pageFails = 0;
+      s_a2d_state = APP_AV_STATE_DISCOVERING;
+      Serial.println("bt sok");
+      esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+      return;
+    }
+    if (event == kA2dpHeartBeat) pageFails++;
+    BluetoothA2DPSource::bt_app_av_state_unconnected_hdlr(event, param);
+  }
+
+  void bt_app_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) override {
+    if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT &&
+        param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED &&
+        s_a2d_state != APP_AV_STATE_DISCOVERED) {
+      Serial.println("bt ingen ny");
+      s_a2d_state = APP_AV_STATE_UNCONNECTED;
+      pageFails = 0;
+      return;
+    }
+    BluetoothA2DPSource::bt_app_gap_callback(event, param);
+  }
+};
+
+static KommA2dp a2dp;
 
 static volatile int linkState = 0;
 static char peerName[48] = "";
@@ -48,6 +81,7 @@ static bool pickDevice(const char* name, esp_bd_addr_t, int rssi) {
 
 static void onConnection(esp_a2d_connection_state_t state, void*) {
   linkState = static_cast<int>(state);
+  if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) a2dp.pageFails = 0;
   uiDirty = true;
   Serial.printf("bt lage %d\n", linkState);
 }
@@ -133,6 +167,19 @@ void setup() {
   a2dp.set_reset_ble(true);
   a2dp.set_volume(100);
   a2dp.start(fillFrames);
+  esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+  esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(iocap));
+  uint8_t* mac = *a2dp.get_last_peer_address();
+  bool any = false;
+  for (int i = 0; i < 6; i++) {
+    if (mac[i] != 0) any = true;
+  }
+  if (any) {
+    Serial.printf("bt minne %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3],
+                  mac[4], mac[5]);
+  } else {
+    Serial.println("bt minne ingen");
+  }
 }
 
 void loop() {
