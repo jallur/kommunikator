@@ -553,9 +553,9 @@ static bool startMic() {
   cfg.sample_rate = CAPTURE_HZ;
   cfg.use_adc = false;
   cfg.stereo = false;
-  // I2S0 is the port the ESP32 Bluetooth controller can hold. The speaker
-  // is already stopped here, so the mic takes I2S1 and cannot stall behind it.
-  cfg.i2s_port = I2S_NUM_1;
+  // The SPM1423 is PDM. On this ESP32 that mode exists only on I2S0.
+  // I2S1 makes i2s_driver_install fail and then the driver dereferences null.
+  cfg.i2s_port = I2S_NUM_0;
   cfg.over_sampling = 2;
   cfg.magnification = 16;
   cfg.dma_buf_len = 128;
