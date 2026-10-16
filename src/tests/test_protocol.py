@@ -42,7 +42,7 @@ def test_session_update_matches_documented_shape() -> None:
     assert payload["type"] == "session.update"
     session = payload["session"]
     assert session["voice"] == "eve"
-    assert session["turn_detection"] == {"type": None}
+    assert session["turn_detection"] is None
     assert session["reasoning"] == {"effort": "none"}
     assert session["resumption"] == {"enabled": True}
     assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
@@ -72,7 +72,7 @@ def test_response_create_quotes_the_user_transcript() -> None:
     assert "Upprepa inte frågan" in text
     assert "extremt kortfattat" in text
     bare = build_response_create(settings, "  ")
-    assert "Senaste yttrandet" not in bare["response"]["instructions"]
+    assert bare == {"type": "response.create"}
 
 
 def test_realtime_url_is_the_documented_endpoint() -> None:

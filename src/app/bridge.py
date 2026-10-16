@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
 import json
 import logging
@@ -41,8 +42,31 @@ class _Turn:
         self.reply_pending = False
         self.user_transcript = ""
         self.device_bytes = 0
+        self.answered_id: int | None = None
+        self.level_peak = 0
+        self.level_sq = 0
+        self.level_n = 0
         self.transcript_ready = asyncio.Event()
         self.reply_task: asyncio.Task[None] | None = None
+
+
+def _note_level(turn: _Turn, pcm: bytes) -> None:
+    """Peak and energy of the PCM we hand to xAI. Samples are not logged."""
+    count = len(pcm) // 2
+    if count == 0:
+        return
+    samples = array.array("h")
+    samples.frombytes(pcm[: count * 2])
+    peak = turn.level_peak
+    total = turn.level_sq
+    for sample in samples:
+        magnitude = -sample if sample < 0 else sample
+        if magnitude > peak:
+            peak = magnitude
+        total += sample * sample
+    turn.level_peak = peak
+    turn.level_sq = total
+    turn.level_n += count
 
 
 def _turn_id(payload: dict) -> int:
@@ -184,16 +208,29 @@ async def _answer_after_transcript(link, settings, turn, xai_lock, turn_id: int,
     except TimeoutError:
         log.info("user transcript missing turn %s", turn_id)
     skipped = False
+    adopted = False
     quote = ""
     try:
         async with xai_lock:
             # Same lock as clear/cancel. A late response.create must not land
-            # after the next turn has wiped the buffer.
-            if not turn.reply_pending or turn.id != turn_id:
+            # after the next turn has wiped the buffer. The live API still
+            # opens a response for real speech even with turn_detection null;
+            # that audio is the reply, so a second create is not sent.
+            if turn.answered_id == turn_id:
+                adopted = True
+                quote = turn.user_transcript.strip()
+            elif not turn.reply_pending or turn.id != turn_id:
                 skipped = True
+            elif turn.response_active:
+                turn.reply_pending = False
+                turn.playing_id = turn_id
+                turn.answered_id = turn_id
+                adopted = True
+                quote = turn.user_transcript.strip()
             else:
                 turn.reply_pending = False
                 turn.playing_id = turn_id
+                turn.answered_id = turn_id
                 quote = turn.user_transcript.strip()
                 await link.send(dumps(build_response_create(settings, quote)))
     except asyncio.CancelledError:
@@ -206,7 +243,10 @@ async def _answer_after_transcript(link, settings, turn, xai_lock, turn_id: int,
         log.info("answer skipped turn %s", turn_id)
         await send_json({"type": "relay", "event": "skip", "turn": turn_id})
         return
-    log.info("response.create turn %s chars %s", turn_id, len(quote))
+    if adopted:
+        log.info("response adopted turn %s chars %s", turn_id, len(quote))
+    else:
+        log.info("response.create turn %s chars %s", turn_id, len(quote))
     await send_json({"type": "relay", "event": "answer", "turn": turn_id, "chars": len(quote)})
 
 
@@ -227,6 +267,7 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
                     turn.device_bytes += len(data)
                     pcm = uplink.process(data)
                     if pcm:
+                        _note_level(turn, pcm)
                         async with xai_lock:
                             if turn.capturing:
                                 await link.send(pcm)
@@ -246,9 +287,13 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
                 turn.sent_audio = False
                 turn.device_bytes = 0
                 turn.user_transcript = ""
+                turn.level_peak = 0
+                turn.level_sq = 0
+                turn.level_n = 0
                 turn.transcript_ready.clear()
                 async with xai_lock:
                     turn.reply_pending = False
+                    turn.answered_id = None
                     turn.id = turn_id
                     turn.playing_id = None
                     turn.announced_speaking = False
@@ -286,6 +331,14 @@ async def _device_to_xai(device, link, uplink, turn, send_json, settings, xai_lo
                         {"type": "relay", "event": "empty", "turn": up_id, "bytes": audio_bytes}
                     )
                     continue
+                rms = int((turn.level_sq / turn.level_n) ** 0.5) if turn.level_n else 0
+                log.info(
+                    "uplink level turn %s peak %s rms %s samples %s",
+                    up_id,
+                    turn.level_peak,
+                    rms,
+                    turn.level_n,
+                )
                 log.info("ptt up turn %s bytes %s commit", up_id, audio_bytes)
                 await send_json(
                     {"type": "relay", "event": "commit", "turn": up_id, "bytes": audio_bytes}
@@ -333,6 +386,11 @@ async def _xai_to_device(link, downlink, turn, send_json, send_bytes, xai_lock) 
         if kind == "response.created":
             turn.response_active = True
             turn.announced_speaking = False
+            async with xai_lock:
+                if turn.reply_pending:
+                    turn.playing_id = turn.id
+                    turn.reply_pending = False
+                    turn.answered_id = turn.id
         elif kind == "response.done":
             turn.response_active = False
         elif kind == "conversation.created":

@@ -41,10 +41,13 @@ def build_session_update(settings: Settings, output_rate: int | None = None) -> 
     """Session shape from the Speech to Speech guide, fetched 2026-10-15.
 
     Swedish is not in the supported-language table. language_hint is still
-    "sv": an unknown code is documented as ignored, and a rejected
-    session.update comes back as an error event. turn_detection.type is null
-    so PTT can commit the buffer. output_rate is the device playback rate
-    (44100 for AirPods). Omitted, the relay default is used.
+    "sv": an unknown code is documented as ignored, and a live session on
+    2026-10-16 transcribed "Vad blir ett plus ett?" with it.
+    turn_detection is JSON null, which is the documented manual-commit
+    mode. The live API still emits speech_started and, for real speech,
+    opens the response itself. {"type": null} was echoed back as {} and
+    did not disable that. output_rate is the device playback rate (44100
+    for AirPods). Omitted, the relay default is used.
     """
     return {
         "type": "session.update",
@@ -52,7 +55,7 @@ def build_session_update(settings: Settings, output_rate: int | None = None) -> 
             "voice": settings.xai_voice,
             "instructions": settings.xai_instructions,
             "reasoning": {"effort": settings.reasoning_effort},
-            "turn_detection": {"type": None},
+            "turn_detection": None,
             "resumption": {"enabled": True},
             "audio": {
                 "input": {
@@ -93,18 +96,20 @@ def user_transcript(event: dict) -> tuple[str, bool] | None:
 def build_response_create(settings: Settings, transcript: str) -> dict:
     """Ask for a reply to the transcribed utterance, not an earlier one.
 
-    response.create instructions replace the session prompt for this turn
-    only, so the session text is repeated and the quote is appended.
+    response.instructions replace the session prompt for this turn only.
+    With a transcript, the session text is repeated and the quote is
+    appended. With none, the bare event keeps the session prompt: copying
+    it without a quote was the wrong form for an empty turn.
     """
-    instructions = settings.xai_instructions
     quote = transcript.strip()
-    if quote:
-        instructions += (
-            "\n\n## Senaste yttrandet\n"
-            "Personen sa precis, ordagrant: "
-            + json.dumps(quote, ensure_ascii=False)
-            + "\nSvara bara på det. Svara inte på en tidigare fråga. Upprepa inte frågan.\n"
-        )
+    if not quote:
+        return {"type": "response.create"}
+    instructions = settings.xai_instructions + (
+        "\n\n## Senaste yttrandet\n"
+        "Personen sa precis, ordagrant: "
+        + json.dumps(quote, ensure_ascii=False)
+        + "\nSvara bara på det. Svara inte på en tidigare fråga. Upprepa inte frågan.\n"
+    )
     return {"type": "response.create", "response": {"instructions": instructions}}
 
 

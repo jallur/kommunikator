@@ -106,6 +106,7 @@ def test_header_token_streams_audio_and_text(settings) -> None:
     sent = factory.links[0].sent
     texts = [json.loads(item) for item in sent if isinstance(item, str)]
     assert texts[0]["type"] == "session.update"
+    assert texts[0]["session"]["turn_detection"] is None
     assert texts[0]["session"]["audio"]["output"]["format"]["rate"] == 16000
     assert any(isinstance(item, bytes) and item for item in sent)
     assert {"type": "input_audio_buffer.commit"} in texts
@@ -253,6 +254,39 @@ def test_ptt_up_for_another_turn_does_not_commit(settings) -> None:
     texts = [json.loads(item) for item in factory.links[0].sent if isinstance(item, str)]
     assert not any(item.get("type") == "input_audio_buffer.commit" for item in texts)
     assert not any(item.get("type") == "response.create" for item in texts)
+
+
+def test_server_opens_the_reply_without_a_second_create(settings) -> None:
+    factory = FakeFactory(vad_reply=True)
+    client = TestClient(create_app(settings, factory))
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down", "turn": 3})
+        ws.send_bytes(b"\x00\x01" * 160)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 3})
+        saw_audio = False
+        states: list[str] = []
+        for _ in range(16):
+            message = ws.receive()
+            if message.get("bytes"):
+                saw_audio = True
+            text = message.get("text")
+            if not text:
+                continue
+            body = json.loads(text)
+            if body.get("type") == "status":
+                states.append(body["state"])
+            if body.get("type") == "status" and body.get("state") == "idle":
+                break
+    texts = [json.loads(item) for item in factory.links[0].sent if isinstance(item, str)]
+    assert any(item.get("type") == "input_audio_buffer.commit" for item in texts)
+    assert not any(item.get("type") == "response.create" for item in texts)
+    assert saw_audio
+    assert "speaking" in states
 
 
 def test_empty_ptt_does_not_commit(settings) -> None:

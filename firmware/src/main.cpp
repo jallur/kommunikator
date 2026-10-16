@@ -84,7 +84,7 @@ static uint32_t micSent = 0;
 static uint32_t micQuietMs = 0;
 static uint32_t micChunkMs = 0;
 static uint32_t micDrop = 0;
-static bool micRestarted = false;
+static int32_t micPeak = 0;
 // One second of 16 kHz lives in PSRAM. A static buffer of that size sits in
 // internal RAM and Bluetooth then fails esp_timer_create with ESP_ERR_NO_MEM.
 static int16_t* micRing = nullptr;
@@ -671,14 +671,13 @@ static void micReader(void*) {
       continue;
     }
     size_t got = 0;
-#if KOMM_A2DP
-    i2s_read(I2S_NUM_0, tmp, sizeof(tmp), &got, pdMS_TO_TICKS(10));
-#else
+    // M5Unified owns the PDM clock, the ESP32 channel swap and the DC
+    // offset. A raw I2S read plus a shift of 4 produced energy that VAD
+    // committed and then refused to transcribe.
     if (M5.Mic.record(tmp, 64, CAPTURE_HZ, false)) {
       for (int i = 0; i < 30 && M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
       if (!M5.Mic.isRecording()) got = sizeof(tmp);
     }
-#endif
     if (got >= sizeof(int16_t)) micPush(tmp, got / sizeof(int16_t));
     micInRead = false;
     if (got < sizeof(int16_t)) vTaskDelay(pdMS_TO_TICKS(5));
@@ -706,14 +705,8 @@ static void stopMic() {
   capQueued = false;
   capLive = false;
   if (!micOpen) return;
-#if KOMM_A2DP
-  i2s_stop(I2S_NUM_0);
-  micWaitIdle();
-  i2s_driver_uninstall(I2S_NUM_0);
-#else
   micWaitIdle();
   M5.Mic.end();
-#endif
   micOpen = false;
 }
 
@@ -722,9 +715,9 @@ static void armMic(const char* how) {
   micOpen = true;
   micSent = 0;
   micDrop = 0;
+  micPeak = 0;
   micQuietMs = millis();
   micChunkMs = millis();
-  micRestarted = false;
   portENTER_CRITICAL(&micMux);
   micRun = true;
   portEXIT_CRITICAL(&micMux);
@@ -736,57 +729,27 @@ static void armMic(const char* how) {
 static bool startMic() {
   stopMic();
   releaseSpeaker();
+  // Plus2's SPM1423 needs M5Unified's PDM clock (DSR128) and DC offset.
+  // The legacy driver plus `sample <<= 4` saturated into a square wave:
+  // xAI committed it and then produced neither a transcript nor audio.
+  M5.Mic.end();
+  auto mic = M5.Mic.config();
+  mic.dma_buf_count = 4;
+  mic.dma_buf_len = 64;
 #if KOMM_A2DP
-  M5.Mic.end();
-  // SPM1423 is PDM, and this ESP32 only has PDM on I2S0. A short DMA
-  // queue overflows while the main loop draws or writes TLS, and the
-  // driver then stays silent until it is started again.
-  i2s_config_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
-  cfg.sample_rate = CAPTURE_HZ;
-  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
-  cfg.communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT;
-  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  cfg.dma_buf_len = 64;
-  i2s_pin_config_t pins;
-  memset(&pins, 0xff, sizeof(pins));
-  pins.ws_io_num = PIN_MIC_CLK;
-  pins.data_in_num = PIN_MIC_DATA;
-  const int dmaCounts[] = {16, 8, 4};
-  esp_err_t err = ESP_FAIL;
-  for (int count : dmaCounts) {
-    cfg.dma_buf_count = count;
-    err = i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
-    if (err == ESP_OK) {
-      Serial.printf("mic dma %d\n", count);
-      break;
-    }
-    i2s_driver_uninstall(I2S_NUM_0);
-    Serial.printf("mic install %d antal %d intern %u storst %u\n", static_cast<int>(err), count,
-                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)));
-  }
-  if (err != ESP_OK) return false;
-  err = i2s_set_pin(I2S_NUM_0, &pins);
-  if (err != ESP_OK) {
-    Serial.printf("mic pin %d\n", static_cast<int>(err));
-    i2s_driver_uninstall(I2S_NUM_0);
-    return false;
-  }
-  i2s_start(I2S_NUM_0);
-  armMic("igang");
-  return true;
-#else
-  M5.Mic.end();
+  // StickC Plus2 PDM defaults in M5Unified 0.2.5. Kept explicit so a
+  // later speaker config cannot leave the mic at the old shift-of-4 gain.
+  mic.over_sampling = 2;
+  mic.magnification = 16;
+  mic.noise_filter_level = 0;
+#endif
+  M5.Mic.config(mic);
   if (!M5.Mic.begin()) {
     Serial.println("mic begin nej");
     return false;
   }
   armMic("m5");
   return true;
-#endif
 }
 
 static bool wsCanSend();
@@ -812,7 +775,8 @@ static void flushCapture() {
       capFill = 0;
     }
   }
-  Serial.printf("mic tot %u tap %u\n", static_cast<unsigned>(micSent), static_cast<unsigned>(micDrop));
+  Serial.printf("mic tot %u tap %u niva %ld\n", static_cast<unsigned>(micSent),
+                static_cast<unsigned>(micDrop), static_cast<long>(micPeak));
 }
 
 static void chirpLedc(bool releaseChirp) {
@@ -1620,9 +1584,7 @@ static void draw() {
 
 static size_t takeCaptured(int16_t* dst, size_t maxn) {
   if (micTaskOn) return micPop(dst, maxn);
-  size_t got = 0;
-  i2s_read(I2S_NUM_0, dst, maxn * sizeof(int16_t), &got, 0);
-  return got / sizeof(int16_t);
+  return 0;
 }
 
 static bool drainMic() {
@@ -1639,7 +1601,6 @@ static bool drainMic() {
     if (samples == 0) break;
     any = true;
     micQuietMs = millis();
-    micRestarted = false;
     for (size_t i = 0; i < samples; i++) {
       if (capFill >= CAPTURE_SAMPLES) {
         if (!sendCapture(capFill)) return true;
@@ -1647,11 +1608,10 @@ static bool drainMic() {
         capLive = true;
       }
       int32_t sample = tmp[i];
-#if KOMM_A2DP
-      sample <<= 4;
-#endif
       if (sample > 32767) sample = 32767;
       if (sample < -32768) sample = -32768;
+      int32_t mag = sample < 0 ? -sample : sample;
+      if (mag > micPeak) micPeak = mag;
       capBuf[capFill++] = static_cast<int16_t>(sample);
     }
   }
@@ -1688,14 +1648,6 @@ static void serviceCapture() {
     }
     micChunkMs = millis();
   }
-#if KOMM_A2DP
-  if (capFill > 0 || micRestarted || millis() - micQuietMs < 200) return;
-  i2s_stop(I2S_NUM_0);
-  i2s_start(I2S_NUM_0);
-  micRestarted = true;
-  micQuietMs = millis();
-  Serial.println("mic omstart");
-#endif
 }
 
 static void printAudio() {
