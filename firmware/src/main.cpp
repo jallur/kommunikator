@@ -70,8 +70,10 @@ static bool wsStarted = false;
 static bool speakerI2sLive = false;
 static bool capQueued = false;
 static bool capLive = false;
-static bool capWarned = false;
-static uint32_t capQueuedMs = 0;
+static bool micOpen = false;
+static size_t capFill = 0;
+static uint32_t listenSince = 0;
+static uint32_t thinkSince = 0;
 static int16_t capBuf[CAPTURE_SAMPLES];
 // The listen path used to block inside a socket write or Mic.record(). Button
 // edges are only sampled from loop(), so the stick then sat on LYSSNAR.
@@ -153,6 +155,7 @@ static const char* stateName(RunState value) {
 
 static void setState(RunState next) {
   if (next == state) return;
+  if (next == RunState::Think) thinkSince = millis();
   state = next;
   uiDirty = true;
   Serial.printf("state %s\n", stateName(state));
@@ -454,7 +457,7 @@ static void logAudio(const char* why) {
       static_cast<unsigned>(stereoDropFrames), static_cast<unsigned>(monoDropSamples),
       a2dpMediaOn ? 1 : 0, a2dpMediaWant ? 1 : 0, pttHeld ? 1 : 0,
       gpio_get_level(static_cast<gpio_num_t>(PIN_BTN_A)) == 0 ? 1 : 0,
-      static_cast<unsigned>(M5.Mic.isRecording()), age, stateName(state));
+      static_cast<unsigned>(capFill), age, stateName(state));
 }
 
 static void releaseSpeaker();
@@ -530,10 +533,15 @@ static bool startSpeaker() {
   // bitstream collapses into noise. playRaw still hands over 16 kHz PCM.
   cfg.sample_rate = playClock;
   cfg.task_priority = 3;
+  // Default is 8 x 256 samples in internal RAM. With Bluetooth and TLS up,
+  // that malloc fails and the driver can keep the buffers.
+  cfg.dma_buf_count = 4;
+  cfg.dma_buf_len = 64;
   M5.Speaker.config(cfg);
   M5.Speaker.setVolume(playVolume);
   bool ok = M5.Speaker.begin();
   speakerI2sLive = ok;
+  if (!ok) i2s_driver_uninstall(cfg.i2s_port);
   if (!ok && useSpk2) {
     useSpk2 = false;
     prefs.putBool("spk2", false);
@@ -542,27 +550,54 @@ static bool startSpeaker() {
   return ok;
 }
 
-static bool startMic() {
+static void stopMic() {
+  capFill = 0;
   capQueued = false;
+  capLive = false;
+  if (!micOpen) return;
+  micOpen = false;
+  i2s_stop(I2S_NUM_0);
+  i2s_driver_uninstall(I2S_NUM_0);
+}
+
+static bool startMic() {
+  stopMic();
   releaseSpeaker();
   M5.Mic.end();
-  auto cfg = M5.Mic.config();
-  cfg.pin_data_in = PIN_MIC_DATA;
-  cfg.pin_ws = PIN_MIC_CLK;
-  cfg.pin_bck = I2S_PIN_NO_CHANGE;
+  // SPM1423 is PDM, and this ESP32 only has PDM on I2S0. Four short DMA
+  // buffers stay in internal RAM while Bluetooth and TLS already hold most of it.
+  i2s_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
   cfg.sample_rate = CAPTURE_HZ;
-  cfg.use_adc = false;
-  cfg.stereo = false;
-  // The SPM1423 is PDM. On this ESP32 that mode exists only on I2S0.
-  // I2S1 makes i2s_driver_install fail and then the driver dereferences null.
-  cfg.i2s_port = I2S_NUM_0;
-  cfg.over_sampling = 2;
-  cfg.magnification = 16;
-  cfg.dma_buf_len = 128;
-  cfg.task_priority = 1;
-  cfg.task_pinned_core = 0;
-  M5.Mic.config(cfg);
-  return M5.Mic.begin();
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 4;
+  cfg.dma_buf_len = 64;
+  i2s_pin_config_t pins;
+  memset(&pins, 0xff, sizeof(pins));
+  pins.ws_io_num = PIN_MIC_CLK;
+  pins.data_in_num = PIN_MIC_DATA;
+  esp_err_t err = i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
+  if (err != ESP_OK) {
+    Serial.printf("mic install %d intern %u storst %u\n", static_cast<int>(err),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)));
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+  err = i2s_set_pin(I2S_NUM_0, &pins);
+  if (err != ESP_OK) {
+    Serial.printf("mic pin %d\n", static_cast<int>(err));
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+  micOpen = true;
+  Serial.printf("mic igang intern %u\n",
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+  return true;
 }
 
 static void chirpLedc(bool releaseChirp) {
@@ -1100,18 +1135,19 @@ static void beginPtt() {
   if (state == RunState::Provision || state == RunState::Wifi) return;
   pttHeld = true;
   listenLive = true;
+  listenSince = millis();
   capQueued = false;
   capLive = false;
-  capWarned = false;
   ringClear();
   setAirpodMedia(false);
   esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
   logAudio("rensar");
   M5.Speaker.stop();
-  if (airpodsOn() && !useSpk2 && !M5.Speaker.isRunning()) startSpeaker();
-  if (useSpk2) {
+  // AirPods already own the radio. Starting the buzzer I2S here asks for
+  // another DMA buffer in internal RAM and fails once Bluetooth is up.
+  if (airpodsOn() || useSpk2) {
     releaseSpeaker();
-    chirp(false);
+    chirpLedc(false);
   } else {
     chirp(false);
     releaseSpeaker();
@@ -1125,6 +1161,7 @@ static void beginPtt() {
     return;
   }
   if (sessionReady) sendPtt("down");
+  listenSince = millis();
   setState(RunState::Listen);
   userLine = "";
   uiDirty = true;
@@ -1140,7 +1177,7 @@ static void abortActivity() {
   pttHeld = false;
   capQueued = false;
   capLive = false;
-  M5.Mic.end();
+  stopMic();
   M5.Speaker.stop();
   ringClear();
   setAirpodMedia(false);
@@ -1162,20 +1199,10 @@ static void endPtt() {
   pttHeld = false;
   capQueued = false;
   capLive = false;
-  M5.Mic.end();
+  stopMic();
   if (sessionReady) sendPtt("up");
-  if (airpodsOn()) {
-    if (!useSpk2) {
-      if (!M5.Speaker.isRunning()) startSpeaker();
-      chirp(true);
-      releaseSpeaker();
-    } else {
-      chirp(true);
-    }
-  } else if (useSpk2) {
-    chirp(true);
-    startSpeaker();
-  } else {
+  if (airpodsOn() || useSpk2) chirpLedc(true);
+  else {
     startSpeaker();
     chirp(true);
   }
@@ -1350,40 +1377,29 @@ static void draw() {
 }
 
 static void serviceCapture() {
-  if (!pttHeld || !sessionReady) return;
+  if (!pttHeld || !sessionReady || !micOpen) return;
   if ((GPIO.in1.data & (1UL << (GPIO_NUM_35 - 32))) == 0) {
     abortActivity();
     return;
   }
-  if (!capQueued) {
-    capLive = false;
-    capWarned = false;
-    capQueuedMs = millis();
-    capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
-    if (!capQueued) Serial.println("mic ko");
+  int16_t tmp[64];
+  size_t got = 0;
+  i2s_read(I2S_NUM_0, tmp, sizeof(tmp), &got, 0);
+  size_t samples = got / sizeof(int16_t);
+  for (size_t i = 0; i < samples && capFill < CAPTURE_SAMPLES; i++) {
+    int32_t sample = static_cast<int32_t>(tmp[i]) << 4;
+    if (sample > 32767) sample = 32767;
+    if (sample < -32768) sample = -32768;
+    capBuf[capFill++] = static_cast<int16_t>(sample);
+  }
+  if (capFill < CAPTURE_SAMPLES) return;
+  if (!wsCanSend()) {
+    capFill = 0;
     return;
   }
-  // record() returns as soon as the buffer is queued. Sending it then lets
-  // the mic task write into a dead stack frame and panics core 1. isRecording()
-  // is also 0 for a moment before the task starts; calling record() again then
-  // spins on the main loop until that buffer finishes, which is how LYSSNAR froze.
-  if (M5.Mic.isRecording()) {
-    capLive = true;
-    return;
-  }
-  if (!capLive) {
-    if (!capWarned && millis() - capQueuedMs > 400) {
-      capWarned = true;
-      Serial.println("mic tyst");
-    }
-    return;
-  }
-  if (!wsCanSend()) return;
   webSocket.sendBIN(reinterpret_cast<uint8_t*>(capBuf), sizeof(capBuf));
-  capLive = false;
-  capWarned = false;
-  capQueuedMs = millis();
-  capQueued = M5.Mic.record(capBuf, CAPTURE_SAMPLES, CAPTURE_HZ);
+  capFill = 0;
+  capLive = true;
 }
 
 static void printAudio() {
@@ -1530,8 +1546,7 @@ static void serviceAudioLog() {
   static uint32_t prevOut = 0;
   static uint32_t prevEmpty = 0;
   size_t queued = airpodsOn() ? stereoAvailFrames() : ringAvailSamples();
-  bool hot = queued > 0 || pttHeld || state == RunState::Speak || state == RunState::Listen ||
-             state == RunState::Think;
+  bool hot = queued > 0 || pttHeld || state == RunState::Speak || state == RunState::Listen;
   if (!hot || millis() - last < 500) return;
   last = millis();
   uint32_t outNow = fillOutFrames;
@@ -1693,13 +1708,16 @@ void loop() {
   loopMs = millis();
   M5.update();
   serviceSerial();
-  if (wantAbort && listenLive) {
+  if (wantAbort && listenLive && millis() - listenSince > 250) {
     uint8_t why = wantAbort;
-    wantAbort = 0;
-    if (why == 2) abortActivity();
-    else if (pttHeld) {
-      Serial.println("ptt upp");
-      endPtt();
+    bool up = gpio_get_level(static_cast<gpio_num_t>(PIN_BTN_A)) != 0;
+    if (why == 2 || up) {
+      wantAbort = 0;
+      if (why == 2) abortActivity();
+      else if (pttHeld) {
+        Serial.println("ptt upp");
+        endPtt();
+      }
     }
   }
   if (state == RunState::Provision) {
@@ -1753,6 +1771,11 @@ void loop() {
   serviceAirpods();
   if (pttHeld) serviceCapture();
   servicePlayback();
+  if (state == RunState::Think && !pttHeld && millis() - thinkSince > 8000 &&
+      stereoAvailFrames() == 0 && ringAvailSamples() == 0) {
+    Serial.println("vantan slut");
+    setState(RunState::Idle);
+  }
   serviceAudioLog();
 
   if (millis() - lastBatteryMs > 10000) {
