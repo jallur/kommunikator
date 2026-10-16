@@ -205,6 +205,38 @@ def test_turn_is_echoed_and_speaking_precedes_audio(settings) -> None:
     assert saw_audio
 
 
+def test_relay_reports_the_commit_without_secrets(settings) -> None:
+    factory = FakeFactory()
+    client = TestClient(create_app(settings, factory))
+    pcm = b"\x00\x01" * 160
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down", "turn": 7})
+        ws.send_bytes(pcm)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 7})
+        bodies: list[dict] = []
+        for _ in range(16):
+            message = ws.receive()
+            text = message.get("text")
+            if not text:
+                continue
+            body = json.loads(text)
+            bodies.append(body)
+            if body.get("type") == "status" and body.get("state") == "idle":
+                break
+    commit = [body for body in bodies if body.get("event") == "commit"]
+    answer = [body for body in bodies if body.get("event") == "answer"]
+    assert commit == [{"type": "relay", "event": "commit", "turn": 7, "bytes": len(pcm)}]
+    assert answer == [{"type": "relay", "event": "answer", "turn": 7, "chars": len("Vad är 5 plus 5?")}]
+    blob = json.dumps(bodies)
+    assert "xai-test-key" not in blob
+    assert "device-token" not in blob
+
+
 def test_ptt_up_for_another_turn_does_not_commit(settings) -> None:
     factory = FakeFactory()
     client = TestClient(create_app(settings, factory))

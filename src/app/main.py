@@ -19,6 +19,20 @@ access_log = logging.getLogger("kommunikator.access")
 relay_log = logging.getLogger("uvicorn.error")
 
 
+def configure_logging() -> None:
+    """Show relay lines in the container log.
+
+    Uvicorn only configures its own loggers. kommunikator.* would otherwise
+    stay on the root logger, whose level drops info.
+    """
+    logger = logging.getLogger("kommunikator")
+    logger.setLevel(logging.INFO)
+    if not any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+        logger.addHandler(handler)
+
+
 class AccessLogMiddleware:
     """Log path and status only. Never the query string or headers."""
 
@@ -55,6 +69,7 @@ def create_app(
     settings: Settings | None = None,
     xai_factory: XaiFactory | None = None,
 ) -> FastAPI:
+    configure_logging()
     cfg = settings or Settings.from_env()
     factory = xai_factory or WebsocketsXaiFactory()
     memory = ConversationMemory()
