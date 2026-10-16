@@ -106,6 +106,7 @@ def test_header_token_streams_audio_and_text(settings) -> None:
     sent = factory.links[0].sent
     texts = [json.loads(item) for item in sent if isinstance(item, str)]
     assert texts[0]["type"] == "session.update"
+    assert texts[0]["session"]["audio"]["output"]["format"]["rate"] == 16000
     assert any(isinstance(item, bytes) and item for item in sent)
     assert {"type": "input_audio_buffer.commit"} in texts
     created = [item for item in texts if item.get("type") == "response.create"]
@@ -117,8 +118,24 @@ def test_header_token_streams_audio_and_text(settings) -> None:
     assert any(message.get("bytes") for message in messages)
 
 
+def test_playback_rate_is_what_xai_is_asked_for(settings) -> None:
+    factory = FakeFactory()
+    client = TestClient(create_app(settings, factory))
+    hello = dict(HELLO)
+    hello["playback_rate"] = 44100
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(hello)
+        ready = ws.receive_json()
+        assert ready["playback_rate"] == 44100
+    texts = [json.loads(item) for item in factory.links[0].sent if isinstance(item, str)]
+    assert texts[0]["session"]["audio"]["output"]["format"]["rate"] == 44100
+
+
 def test_downlink_audio_is_split_below_the_stick_limit(settings) -> None:
-    # 24 kHz in, 16 kHz out: 9000 samples become 6000 samples, 12000 bytes.
+    # Hello asks for 16 kHz, so the relay copies the 9000 samples (18000 bytes).
     factory = FakeFactory(downlink_pcm=b"\x10\x00" * 9000)
     client = TestClient(create_app(settings, factory))
     with client.websocket_connect(

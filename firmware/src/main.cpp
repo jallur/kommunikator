@@ -87,7 +87,7 @@ static unsigned long lastBatteryMs = 0;
 // 24 KB held under a second, and a full ring used to drop a single byte, so
 // every later sample was swapped and the buzzer turned into noise. 56 KB is
 // what still fits in DRAM: about 1.7 s. Past that, whole samples are dropped.
-static constexpr size_t kRingBytes = 56 * 1024;
+static constexpr size_t kRingBytes = 256 * 1024;
 static uint8_t* audioRing = nullptr;
 // AirPods want 44.1 kHz stereo. This holds about 3 s of that, in PSRAM.
 // The Bluetooth callback only copies from it.
@@ -106,13 +106,16 @@ static uint8_t* replayBytes = nullptr;
 static size_t replayCap = 0;
 static size_t replayLen = 0;
 static uint8_t playVolume = 200;
+static uint8_t screenBright = 170;
+static bool setupOpen = false;
+static int setupSel = 0;
 static uint32_t playClock = 48000;
 static uint8_t buzzerMag = 48;
 static uint8_t spk2Mag = 16;
 static portMUX_TYPE audioMux = portMUX_INITIALIZER_UNLOCKED;
-// Two of these sit in the speaker queue. 512 samples is 32 ms at 16 kHz,
-// so one screen redraw cannot empty the queue.
-static constexpr size_t kPlaySamples = 512;
+// Two of these sit in the speaker queue. About 32 ms, so one screen redraw
+// cannot empty the queue.
+static constexpr size_t kPlaySamples = 1408;
 static int16_t playBuf[3][kPlaySamples];
 static uint8_t playIdx = 0;
 
@@ -326,7 +329,7 @@ static void stereoFromPcm(const uint8_t* data, size_t len) {
       stereoRing[w + 2] = stereoRing[w];
       stereoRing[w + 3] = stereoRing[w + 1];
       w = (w + 4) % kStereoBytes;
-      stFrac += 16000;
+      stFrac += static_cast<int32_t>(PLAYBACK_HZ);
     }
     stFrac -= 44100;
     stPrev = cur;
@@ -525,6 +528,7 @@ static void sendHello() {
   doc["format"] = "pcm16le";
   doc["device_id"] = "stickc-plus2";
   sendJson(doc);
+  Serial.printf("hello spel %u\n", static_cast<unsigned>(PLAYBACK_HZ));
 }
 
 static void sendPtt(const char* edge) {
@@ -874,6 +878,8 @@ static void loadConfig() {
     if (nvs_get_u8(handle, "spk2", &flag) == ESP_OK) useSpk2 = flag != 0;
     nvs_close(handle);
   }
+  playVolume = prefs.getUChar("vol", playVolume);
+  screenBright = prefs.getUChar("bright", screenBright);
 #ifdef KOMM_WIFI_SSID
   if (wifiSsid.length() == 0) wifiSsid = KOMM_WIFI_SSID;
 #ifdef KOMM_WIFI_PASS
@@ -994,6 +1000,98 @@ static void toggleOutput() {
   markActivity();
 }
 
+static void printFitted(const char* text, int maxW);
+
+static const int kSetupRows = 7;
+
+static void bumpVolume() {
+  int next = (static_cast<int>(playVolume) / 25 + 1) * 25;
+  if (next > 250) next = 0;
+  playVolume = static_cast<uint8_t>(next);
+  prefs.putUChar("vol", playVolume);
+  if (M5.Speaker.isRunning()) M5.Speaker.setVolume(playVolume);
+  a2dp.set_volume(avrcpVolume());
+}
+
+static void bumpBright() {
+  if (screenBright < 80) screenBright = 100;
+  else if (screenBright < 140) screenBright = 170;
+  else screenBright = 40;
+  prefs.putUChar("bright", screenBright);
+  M5.Display.setBrightness(screenBright);
+}
+
+static void adjustSetup() {
+  if (setupSel == 0) bumpVolume();
+  else if (setupSel == 1) toggleOutput();
+  else if (setupSel == 2) bumpBright();
+  uiDirty = true;
+  markActivity();
+}
+
+static void setupValue(int row, char* buf, size_t n) {
+  buf[0] = 0;
+  if (row == 0) snprintf(buf, n, "%u", playVolume);
+  else if (row == 1) snprintf(buf, n, "%s", useSpk2 ? "SPK2" : "SUM");
+  else if (row == 2) snprintf(buf, n, "%u", screenBright);
+  else if (row == 3) {
+    if (WiFi.status() == WL_CONNECTED) {
+      snprintf(buf, n, "%ddB %s", WiFi.RSSI(), wifiSsid.c_str());
+    } else {
+      snprintf(buf, n, "ingen");
+    }
+  } else if (row == 4) {
+    snprintf(buf, n, "%s", sessionReady ? relayHost.c_str() : "ej kopplad");
+  } else if (row == 5) {
+    if (batteryMv > 0) snprintf(buf, n, "%d mV", batteryMv);
+    else snprintf(buf, n, "okand");
+  } else if (airpodsOn() && a2dpName[0]) {
+    snprintf(buf, n, "%s", a2dpName);
+  } else if (airpodsOn()) {
+    snprintf(buf, n, "kopplad");
+  } else {
+    snprintf(buf, n, "inga");
+  }
+}
+
+static const char* setupLabel(int row) {
+  switch (row) {
+    case 0: return "Volym";
+    case 1: return "Utgang";
+    case 2: return "Ljus";
+    case 3: return "WiFi";
+    case 4: return "Relay";
+    case 5: return "Batteri";
+    default: return "Lurar";
+  }
+}
+
+static void drawSetup() {
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextColor(0xFD20, TFT_BLACK);
+  M5.Display.setTextWrap(false);
+  int lh = lineHeightPx();
+  M5.Display.setCursor(4, 2);
+  M5.Display.print("INSTALLNING");
+  const char* hint = "PWR";
+  M5.Display.setCursor(M5.Display.width() - M5.Display.textWidth(hint) - 4, 2);
+  M5.Display.print(hint);
+  for (int row = 0; row < kSetupRows; row++) {
+    int y = 2 + lh + row * lh;
+    M5.Display.setCursor(2, y);
+    M5.Display.print(row == setupSel ? ">" : " ");
+    const char* label = setupLabel(row);
+    M5.Display.print(label);
+    char value[48];
+    setupValue(row, value, sizeof(value));
+    int x = 8 + M5.Display.textWidth(label) + 8;
+    int room = M5.Display.width() - x - 4;
+    if (room < 24) room = 24;
+    M5.Display.setCursor(x, y);
+    printFitted(value, room);
+  }
+}
+
 static void printFitted(const char* text, int maxW) {
   if (text[0] == 0) return;
   if (M5.Display.textWidth(text) <= maxW) {
@@ -1014,6 +1112,11 @@ static void printFitted(const char* text, int maxW) {
 }
 
 static void draw() {
+  if (setupOpen) {
+    drawSetup();
+    uiDirty = false;
+    return;
+  }
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextColor(0xFD20, TFT_BLACK);
   M5.Display.setTextWrap(false);
@@ -1100,17 +1203,17 @@ static void playTone() {
   captureReplay = false;
   ringClear();
   int16_t chunk[128];
-  const int total = 16000;
+  const int total = static_cast<int>(PLAYBACK_HZ);
   for (int i = 0; i < total;) {
     int n = 128;
     if (i + n > total) n = total - i;
     for (int s = 0; s < n; s++) {
       int t = i + s;
       float v;
-      if (t < 3200) {
-        v = sinf(t * 6.2831853f * 440.0f / 16000.0f);
+      if (t < static_cast<int>(PLAYBACK_HZ / 5)) {
+        v = sinf(t * 6.2831853f * 440.0f / static_cast<float>(PLAYBACK_HZ));
       } else {
-        float phase = t * 6.2831853f * 180.0f / 16000.0f;
+        float phase = t * 6.2831853f * 180.0f / static_cast<float>(PLAYBACK_HZ);
         v = sinf(phase) * 0.55f + sinf(phase * 2.0f) * 0.3f + sinf(phase * 3.0f) * 0.15f;
       }
       int sample = static_cast<int>(v * 10000.0f);
@@ -1240,8 +1343,12 @@ static void servicePlayback() {
 }
 
 static void maybeSleep() {
+  if (setupOpen) {
+    M5.Display.setBrightness(screenBright);
+    return;
+  }
   if (state != RunState::Idle) {
-    if (state != RunState::Provision) M5.Display.setBrightness(170);
+    if (state != RunState::Provision) M5.Display.setBrightness(screenBright);
     return;
   }
   unsigned long quiet = millis() - lastActivity;
@@ -1262,7 +1369,7 @@ static void maybeSleep() {
   esp_light_sleep_start();
   gpio_hold_dis(GPIO_NUM_4);
   digitalWrite(PIN_HOLD, HIGH);
-  M5.Display.setBrightness(170);
+  M5.Display.setBrightness(screenBright);
   markActivity();
   wsStarted = false;
   beginWifi();
@@ -1286,14 +1393,14 @@ void setup() {
   M5.Display.setRotation(1);
   M5.Display.setFont(&fonts::Font2);
   M5.Display.setTextSize(1);
-  M5.Display.setBrightness(170);
+  M5.Display.setBrightness(screenBright);
   M5.Display.setTextWrap(false);
   M5.BtnB.setHoldThresh(700);
   speakerI2sLive = cfg.internal_spk || useSpk2;
   if (!allocRing()) Serial.println("ljud ring saknas");
   startSpeaker();
   M5.Mic.end();
-  replayCap = 32 * 1024;
+  replayCap = 256 * 1024;
   replayBytes = static_cast<uint8_t*>(heap_caps_malloc(replayCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!replayBytes) replayBytes = static_cast<uint8_t*>(malloc(replayCap));
   if (!replayBytes) {
@@ -1330,17 +1437,32 @@ void loop() {
     webSocket.loop();
   }
 
-  if (M5.BtnA.wasPressed()) {
-    Serial.println("ptt ned");
-    beginPtt();
+  if (!pttHeld && state != RunState::Provision && millis() > 1500 && M5.BtnPWR.wasClicked()) {
+    setupOpen = !setupOpen;
+    uiDirty = true;
+    markActivity();
+    Serial.println(setupOpen ? "installning oppnas" : "installning stangs");
   }
-  if (M5.BtnA.wasReleased()) {
-    Serial.println("ptt upp");
-    endPtt();
-  }
-  if (!pttHeld && state != RunState::Listen) {
-    if (M5.BtnB.wasReleaseFor(700)) toggleOutput();
-    else if (M5.BtnB.wasClicked()) scrollAnswer();
+  if (setupOpen) {
+    if (M5.BtnB.wasClicked()) {
+      setupSel = (setupSel + 1) % kSetupRows;
+      uiDirty = true;
+      markActivity();
+    }
+    if (M5.BtnA.wasClicked()) adjustSetup();
+  } else {
+    if (M5.BtnA.wasPressed()) {
+      Serial.println("ptt ned");
+      beginPtt();
+    }
+    if (M5.BtnA.wasReleased()) {
+      Serial.println("ptt upp");
+      endPtt();
+    }
+    if (!pttHeld && state != RunState::Listen) {
+      if (M5.BtnB.wasReleaseFor(700)) toggleOutput();
+      else if (M5.BtnB.wasClicked()) scrollAnswer();
+    }
   }
 
   serviceAirpods();
@@ -1352,6 +1474,13 @@ void loop() {
     int next = M5.Power.getBatteryVoltage();
     if (next != batteryMv) {
       batteryMv = next;
+      uiDirty = true;
+    }
+  }
+  if (setupOpen) {
+    static unsigned long lastSetupDraw = 0;
+    if (millis() - lastSetupDraw > 1000) {
+      lastSetupDraw = millis();
       uiDirty = true;
     }
   }

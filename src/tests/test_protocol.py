@@ -48,6 +48,8 @@ def test_session_update_matches_documented_shape() -> None:
     assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
     assert session["audio"]["input"]["transport"] == "binary"
     assert session["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    asked = build_session_update(settings, 44100)
+    assert asked["session"]["audio"]["output"]["format"]["rate"] == 44100
     assert session["audio"]["output"]["transport"] == "binary"
     assert session["audio"]["input"]["transcription"]["model"] == "grok-transcribe"
     assert session["audio"]["input"]["transcription"]["language_hint"] == "sv"

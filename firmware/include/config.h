@@ -24,10 +24,10 @@
 #endif
 
 // PCM rates announced to the relay. Both are in the xAI PCM rate list.
-// Uplink is 16 kHz. Downlink from xAI is 24 kHz and the relay resamples
-// to PLAYBACK_HZ. See DESIGN.md.
+// Uplink stays 16 kHz (wideband, for the mic). Playback is 44.1 kHz, the
+// same rate AirPods play, so the relay asks Grok for it and does not resample.
 static const uint32_t CAPTURE_HZ = 16000;
-static const uint32_t PLAYBACK_HZ = 16000;
+static const uint32_t PLAYBACK_HZ = 44100;
 static const size_t CAPTURE_SAMPLES = 320;  // 20 ms
 
 // StickC-Plus2 pin map:

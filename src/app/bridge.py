@@ -79,7 +79,7 @@ async def bridge(
                 await device.send_bytes(bytes(view[start : start + _DEVICE_AUDIO_CHUNK]))
 
     try:
-        await link.send(dumps(build_session_update(settings)))
+        await link.send(dumps(build_session_update(settings, hello.playback_rate)))
         conversation_id = await _wait_session_updated(link, token, memory)
         await send_json(
             {
@@ -91,7 +91,7 @@ async def bridge(
             }
         )
         uplink = Pcm16Resampler(hello.capture_rate, settings.xai_input_rate)
-        downlink = Pcm16Resampler(settings.xai_output_rate, hello.playback_rate)
+        downlink = Pcm16Resampler(hello.playback_rate, hello.playback_rate)
         turn = _Turn()
         async with asyncio.TaskGroup() as group:
             group.create_task(_device_to_xai(device, link, uplink, turn, send_json, settings))

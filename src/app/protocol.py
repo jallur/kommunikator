@@ -37,13 +37,14 @@ def parse_hello(payload: dict) -> Hello:
     return Hello(capture_rate=capture, playback_rate=playback, device_id=device_id)
 
 
-def build_session_update(settings: Settings) -> dict:
+def build_session_update(settings: Settings, output_rate: int | None = None) -> dict:
     """Session shape from the Speech to Speech guide, fetched 2026-10-15.
 
     Swedish is not in the supported-language table. language_hint is still
     "sv": an unknown code is documented as ignored, and a rejected
     session.update comes back as an error event. turn_detection.type is null
-    so PTT can commit the buffer.
+    so PTT can commit the buffer. output_rate is the device playback rate
+    (44100 for AirPods). Omitted, the relay default is used.
     """
     return {
         "type": "session.update",
@@ -63,7 +64,10 @@ def build_session_update(settings: Settings) -> dict:
                     },
                 },
                 "output": {
-                    "format": {"type": "audio/pcm", "rate": settings.xai_output_rate},
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": settings.xai_output_rate if output_rate is None else output_rate,
+                    },
                     "transport": "binary",
                 },
             },

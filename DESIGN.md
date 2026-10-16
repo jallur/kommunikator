@@ -46,7 +46,7 @@ Payload som relayn skickar:
 | `instructions` | Svenska regler under guidens engelska avsnittsnamn. Primärt svenska, inget norskt eller danskt, engelska bara som inflikade ord, extremt kort, upprepa inte frågan. | Guiden säger att extra språk styrs i instruktionen, och att avsnittsnamnen ska ligga nära träningsformen. |
 | `turn_detection.type` | `null` | `input_audio_buffer.commit` finns bara när turn detection är null. PTT är den manuella vägen. |
 | `audio.input.format` | `audio/pcm`, 16000 | PCM-takter som dokumentationen listar: 8000, 16000, 22050, 24000, 32000, 44100, 48000. 16000 beskrivs som wideband, bra för tal. |
-| `audio.output.format` | `audio/pcm`, 24000 | 24000 är default och rekommenderad takt. |
+| `audio.output.format` | `audio/pcm`, enhetens `playback_rate` | Firmware ber om 44100. Det är CD-kvalitet i PCM-listan, samma takt som AirPods spelar, så relayn inte samplar om. |
 | `audio.*.transport` | `binary` | Rå PCM16 little-endian i binära frames. JSON-händelser (transkript, status) stannar text. |
 | `resumption.enabled` | `true` | `conversation.created.conversation.id` sparas i relayns minne, hashat per enhetstoken, och skickas som `conversation_id` vid återanslutning. Historiken faller efter 30 minuters inaktivitet. |
 | `audio.input.transcription.model` | `grok-transcribe` | Se TODO. Behövs enligt kompatibilitetsnoten för live-transkript av användaren. |
@@ -67,9 +67,9 @@ Upp: SPM1423 PDM → PCM16 mono 16 kHz → binär WebSocket-frame.
 
 Relayn resamplar till `XAI_INPUT_RATE` (default 16000). Lika takt är en kopia. Annars linjär interpolation, ett sample latens över chunk-gränsen, så att det inte klickar.
 
-Ned: xAI PCM16 vid `XAI_OUTPUT_RATE` (default 24000) → relayn resamplar till den takt enheten anmälde i `hello.playback_rate` (firmware: 16000) → binär frame → den inbyggda summern. Hat SPK2 är av tills knapp B hålls inne.
+Ned: xAI PCM16 vid den takt enheten anmälde i `hello.playback_rate` (firmware: 44100) → relayn kopierar när takterna är lika → binär frame. AirPods får varje mono-sample som vänster och höger. Summern och SPK2 spelar samma 44100. Hat SPK2 är av tills knapp B hålls inne. Strömknappen öppnar inställningsskärmen.
 
-Summern är en 1-bitsmodulator. I2S-klockan ligger på 48 kHz, medan `playRaw` fortfarande får 16 kHz, så M5Unified samplar upp. Ringen är 56 KB och släpper bara hela samples. Två ljudbuffertar på 32 ms vardera ligger i kön så en skärmritning inte hinner tysta talet.
+Summern är en 1-bitsmodulator. I2S-klockan ligger på 48 kHz, medan `playRaw` får 44100, så M5Unified samplar upp. Ringen är 256 KB i PSRAM och släpper bara hela samples. Två ljudbuffertar på 32 ms vardera ligger i kön så en skärmritning inte hinner tysta talet.
 
 Serieporten tar ljudkommandon, en rad per tryck på retur (`pio device monitor -f send_on_enter`). `t` spelar en sekunds ton genom samma väg som svaret. `p` spelar senaste mottagna svaret igen, utan nytt anrop till xAI. `v` sätter volym 0–255, `r` sätter I2S-klockan, `m` sätter förstärkning 1–64. Stickan svarar `ljud v=… klocka=… mag=…`.
 
@@ -98,7 +98,7 @@ Chirp vid tryck är ett stigande pip, vid släpp ett fallande. Det är en TOS-li
 
 M5:s mic-exempel kör SPM1423 i 44100 Hz. 44100 finns i xAI:s PCM-lista. Firmware annonserar faktisk takt i `hello`, och relayn resamplar. TODO om 16 kHz PDM låter dåligt: höj `CAPTURE_HZ` till 44100.
 
-Hat SPK2-sidan säger både "32 kHz till 192 kHz" i punktlistan och "8 kHz ~ 96 kHz" i specifikationen. MAX98357 i M5Unified körs här på 16 kHz. TODO om hatten är tyst: sätt `PLAYBACK_HZ` till 32000. Relayn följer `hello`.
+Hat SPK2-sidan säger både "32 kHz till 192 kHz" i punktlistan och "8 kHz ~ 96 kHz" i specifikationen. `playRaw` får 44100 och M5Unified samplar till I2S-klockan. Relayn följer `hello`.
 
 ## Enhetsprotokoll
 
@@ -108,7 +108,7 @@ Auth är bara `Authorization: Bearer <enhetstoken>`. Query `token` accepteras in
 
 Efter accept:
 
-1. Enheten skickar `{"type":"hello","capture_rate":16000,"playback_rate":16000,"format":"pcm16le","device_id":"stickc-plus2"}`.
+1. Enheten skickar `{"type":"hello","capture_rate":16000,"playback_rate":44100,"format":"pcm16le","device_id":"stickc-plus2"}`.
 2. Relayn kopplar upp xAI, väntar på `session.updated`, svarar `hello.ok` med takterna och `conversation_id`.
 3. `{"type":"ptt","state":"down"|"up"}` ramar in binära PCM-frames.
 4. Relayn skickar binär PCM ned, plus JSON:
