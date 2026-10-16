@@ -506,6 +506,8 @@ static void logAudio(const char* why) {
 static void releaseSpeaker();
 static bool startSpeaker();
 
+static bool airpodsStarted = false;
+
 #if KOMM_A2DP
 static void startAirpods() {
   Serial.println("bt start, satt AirPods i parning");
@@ -532,12 +534,12 @@ static void serviceAirpods() {
   }
   if (now == ESP_A2D_CONNECTION_STATE_CONNECTED) {
     Serial.printf("bt kopplad %s\n", a2dpName);
-    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+    if (state != RunState::Wifi) esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     if (!pttHeld) releaseSpeaker();
   } else if (prev == ESP_A2D_CONNECTION_STATE_CONNECTED &&
              now == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     Serial.println("bt slapp");
-    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+    if (state != RunState::Wifi) esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     if (!pttHeld) startSpeaker();
   }
 }
@@ -547,6 +549,12 @@ static void startAirpods() {
 }
 static void serviceAirpods() {}
 #endif
+
+static void ensureAirpods() {
+  if (airpodsStarted) return;
+  airpodsStarted = true;
+  startAirpods();
+}
 
 static void releaseSpeaker() {
   i2s_port_t port = M5.Speaker.config().i2s_port;
@@ -993,6 +1001,9 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       sessionReady = false;
+#if KOMM_A2DP
+      esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+#endif
       setState(RunState::Connecting);
       sendHello();
       break;
@@ -1225,6 +1236,12 @@ static void startWebSocket() {
     return;
   }
   Serial.printf("wifi %s rssi %d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  // Association is done. Bluetooth may start now, but the relay handshake
+  // still needs the radio until the socket is up.
+  ensureAirpods();
+#if KOMM_A2DP
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+#endif
   cacheRelayIp(relayHost.c_str());
   logTls();
   // The library adds the trailing CRLF. One here would end the request early.
@@ -1307,14 +1324,66 @@ static void enterProvision() {
   uiDirty = true;
 }
 
+static uint32_t wifiArmedMs = 0;
+static uint32_t wifiBeganMs = 0;
+static uint32_t wifiLogMs = 0;
+
+static const char* wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS: return "vantar";
+    case WL_NO_SSID_AVAIL: return "inget nat";
+    case WL_SCAN_COMPLETED: return "skannad";
+    case WL_CONNECTED: return "kopplad";
+    case WL_CONNECT_FAILED: return "nekad";
+    case WL_CONNECTION_LOST: return "tappad";
+    case WL_DISCONNECTED: return "fran";
+    default: return "okand";
+  }
+}
+
 static void beginWifi() {
   setState(RunState::Wifi);
+  // AirPods paging and Wi-Fi association share one radio. Prefer Wi-Fi
+  // until the relay socket exists, or the stick stays in WIFI forever.
+#if KOMM_A2DP
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+#endif
   WiFi.mode(WIFI_STA);
   // Classic Bluetooth and Wi-Fi share the radio. The IDF aborts if modem
   // sleep is off while both are enabled.
   WiFi.setSleep(true);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  wifiArmedMs = millis();
+  wifiBeganMs = wifiArmedMs;
+  wifiLogMs = wifiArmedMs;
+  Serial.printf("wifi start %s\n", wifiSsid.c_str());
   uiDirty = true;
+}
+
+static void serviceWifi() {
+  if (state != RunState::Wifi) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    startWebSocket();
+    return;
+  }
+  uint32_t now = millis();
+  if (now - wifiLogMs >= 2000) {
+    wifiLogMs = now;
+    wl_status_t status = WiFi.status();
+    Serial.printf("wifi status %d %s\n", static_cast<int>(status), wifiStatusName(status));
+  }
+  if (!airpodsStarted && wifiArmedMs != 0 && now - wifiArmedMs >= 12000) {
+    ensureAirpods();
+#if KOMM_A2DP
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+#endif
+  }
+  if (wifiBeganMs != 0 && now - wifiBeganMs >= 8000) {
+    wifiBeganMs = now;
+    Serial.println("wifi omstart");
+    WiFi.disconnect(false);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  }
 }
 
 static void beginPtt() {
@@ -1943,7 +2012,6 @@ void setup() {
   printAudio();
   markActivity();
   startMicTask();
-  startAirpods();
 
   M5.update();
   xTaskCreatePinnedToCore(
@@ -2018,7 +2086,7 @@ void loop() {
   }
 
   if (state == RunState::Wifi) {
-    if (WiFi.status() == WL_CONNECTED) startWebSocket();
+    serviceWifi();
   } else if (wsStarted) {
     if (pttHeld) serviceCapture();
     webSocket.loop();
@@ -2032,8 +2100,12 @@ void loop() {
     if (M5.BtnA.wasClicked()) adjustSetup();
   } else {
     if (M5.BtnA.wasPressed()) {
-      Serial.println("ptt ned");
-      beginPtt();
+      if (state == RunState::Wifi || state == RunState::Provision) {
+        Serial.println("ptt vantar nat");
+      } else {
+        Serial.println("ptt ned");
+        beginPtt();
+      }
     }
     if (M5.BtnA.wasReleased()) {
       Serial.println("ptt upp");
