@@ -279,6 +279,7 @@ static bool airpodsOn() {
 
 static bool a2dpMediaOn = false;
 static bool a2dpMediaWant = false;
+static unsigned long a2dpCmdMs = 0;
 static IPAddress relayIp;
 static bool relayIpOk = false;
 
@@ -288,12 +289,27 @@ static void onA2dpAudio(esp_a2d_audio_state_t audio, void*) {
 }
 
 static void setAirpodMedia(bool run) {
-  if (!airpodsOn()) return;
-  if (run == a2dpMediaWant) return;
+  if (!airpodsOn()) {
+    a2dpMediaWant = false;
+    return;
+  }
+  if (run) {
+    if (a2dpMediaOn) {
+      a2dpMediaWant = true;
+      return;
+    }
+    if (a2dpMediaWant && millis() - a2dpCmdMs < 500) return;
+  } else if (!a2dpMediaOn) {
+    a2dpMediaWant = false;
+    return;
+  } else if (!a2dpMediaWant && millis() - a2dpCmdMs < 500) {
+    return;
+  }
   a2dpMediaWant = run;
+  a2dpCmdMs = millis();
   esp_err_t err = esp_a2d_media_ctrl(run ? ESP_A2D_MEDIA_CTRL_START : ESP_A2D_MEDIA_CTRL_SUSPEND);
-  Serial.printf("bt media %s %d\n", run ? "start" : "paus", static_cast<int>(err));
-  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) a2dpMediaWant = !run;
+  Serial.printf("bt media %s %d on %d\n", run ? "start" : "paus", static_cast<int>(err),
+                a2dpMediaOn ? 1 : 0);
 }
 
 static void cacheRelayIp(const char* host) {
