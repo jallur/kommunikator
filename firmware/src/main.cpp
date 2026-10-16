@@ -362,6 +362,9 @@ static unsigned long a2dpCmdMs = 0;
 // Stays set for the whole reply. Clearing it whenever the buffer dips under
 // the start watermark suspends A2DP and opens a gap of about a second.
 static volatile bool airpodLatched = false;
+// Silence ahead of the first real frame. AirPods drop the start of a new
+// A2DP stream while SBC locks, which ate everything before "två".
+static volatile size_t airpodPrerollLeft = 0;
 #else
 static int a2dpState = 0;
 static int appliedA2dp = 0;
@@ -371,6 +374,7 @@ static bool a2dpMediaOn = false;
 static bool a2dpMediaWant = false;
 static unsigned long a2dpCmdMs = 0;
 static volatile bool airpodLatched = false;
+static volatile size_t airpodPrerollLeft = 0;
 #endif
 static IPAddress relayIp;
 static bool relayIpOk = false;
@@ -523,13 +527,26 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
     fillEmptyCalls++;
     return 0;
   }
+  // The wrapper already zeroed the buffer. Spend the opening of a new stream
+  // on that silence so the decoder locks before any word is sent.
+  int32_t filled = 0;
+  size_t silence = airpodPrerollLeft;
+  if (silence > 0) {
+    if (silence > static_cast<size_t>(count)) silence = static_cast<size_t>(count);
+    airpodPrerollLeft -= silence;
+    filled = static_cast<int32_t>(silence);
+    fillOutFrames += static_cast<uint32_t>(silence);
+    if (filled == count) return count;
+  }
   size_t have = stereoAvailFrames();
-  size_t n = have < static_cast<size_t>(count) ? have : static_cast<size_t>(count);
+  size_t room = static_cast<size_t>(count - filled);
+  size_t n = have < room ? have : room;
   size_t r = stR;
   for (size_t i = 0; i < n; i++) {
     size_t o = (r + i * 4) % kStereoBytes;
     int16_t sample = static_cast<int16_t>(stereoRing[o] | (static_cast<uint16_t>(stereoRing[o + 1]) << 8));
-    frame[i].channel1 = frame[i].channel2 = sample;
+    frame[filled + static_cast<int32_t>(i)].channel1 = sample;
+    frame[filled + static_cast<int32_t>(i)].channel2 = sample;
   }
   if (n > 0) {
     size_t next = (r + n * 4) % kStereoBytes;
@@ -537,11 +554,11 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
     if (stR == r) stR = next;
     portEXIT_CRITICAL(&stMux);
     fillOutFrames += static_cast<uint32_t>(n);
-  } else {
+  } else if (filled == 0) {
     fillEmptyCalls++;
   }
-  // The wrapper already cleared the buffer. Returning the full request keeps
-  // the A2DP clock running through the quiet between xAI's packets.
+  // Returning the full request keeps the A2DP clock running through the
+  // quiet between xAI's packets. The tail of the buffer is still zero.
   return count;
 }
 #endif
@@ -2194,10 +2211,14 @@ static void servicePlayback() {
     constexpr unsigned long kTailMs = 600;
     if (pttHeld) {
       airpodLatched = false;
+      airpodPrerollLeft = 0;
     } else if (!airpodLatched) {
       airpodLatched = queued >= kPrimeFrames || (queued > 0 && age > kTailMs);
+      // 400 ms at 44.1 kHz. Only on the edge that opens the stream.
+      if (airpodLatched) airpodPrerollLeft = 17640;
     } else if (queued == 0 && age > kTailMs) {
       airpodLatched = false;
+      airpodPrerollLeft = 0;
     }
     bool feed = airpodLatched;
     static bool fed = false;
@@ -2206,12 +2227,17 @@ static void servicePlayback() {
       logAudio(feed ? "spela" : "vantar");
     }
     setAirpodMedia(feed);
+    // beginPtt forces Wi-Fi. A change-only check would leave that in place
+    // if the last playback mode was already "balance", so drop the memory
+    // whenever the stream is closed and apply balance again when it opens.
+    // Preferring Bluetooth here starved the socket and cut the reply.
     static int coexMode = -1;
-    int want = feed ? 1 : 2;
-    if (want != coexMode) {
-      coexMode = want;
-      esp_coex_preference_set(want == 1 ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_BALANCE);
-      Serial.printf("ljud radio %s\n", want == 1 ? "bt" : "balans");
+    if (!feed) {
+      coexMode = -1;
+    } else if (coexMode != 2) {
+      coexMode = 2;
+      esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+      Serial.println("ljud radio balans");
     }
     if (!feed && state == RunState::Speak && queued == 0 && age > kTailMs) {
       setState(RunState::Idle);
