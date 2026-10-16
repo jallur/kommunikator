@@ -16,6 +16,7 @@
 #include <driver/i2s.h>
 #include <driver/rtc_io.h>
 #include <esp_heap_caps.h>
+#include <esp_coexist.h>
 #include <mbedtls/platform.h>
 
 #include <BluetoothA2DPSource.h>
@@ -88,6 +89,15 @@ static unsigned long lastBatteryMs = 0;
 // what still fits in DRAM: about 1.7 s. Past that, whole samples are dropped.
 static constexpr size_t kRingBytes = 56 * 1024;
 static uint8_t* audioRing = nullptr;
+// AirPods want 44.1 kHz stereo. This holds about 3 s of that, in PSRAM.
+// The Bluetooth callback only copies from it.
+static constexpr size_t kStereoBytes = 512 * 1024;
+static uint8_t* stereoRing = nullptr;
+static volatile size_t stR = 0;
+static volatile size_t stW = 0;
+static int16_t stPrev = 0;
+static int32_t stFrac = 0;
+static portMUX_TYPE stMux = portMUX_INITIALIZER_UNLOCKED;
 static size_t ringR = 0;
 static size_t ringW = 0;
 static unsigned long lastAudioMs = 0;
@@ -165,8 +175,11 @@ static bool allocRing() {
   audioRing = static_cast<uint8_t*>(heap_caps_malloc(kRingBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!audioRing) audioRing = static_cast<uint8_t*>(malloc(kRingBytes));
   if (!audioRing) return false;
+  stereoRing = static_cast<uint8_t*>(heap_caps_malloc(kStereoBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   Serial.printf("ljud ring %u %s\n", static_cast<unsigned>(kRingBytes),
                 esp_ptr_external_ram(audioRing) ? "psram" : "dram");
+  Serial.printf("ljud stereo %u %s\n", static_cast<unsigned>(kStereoBytes),
+                stereoRing && esp_ptr_external_ram(stereoRing) ? "psram" : "saknas");
   return true;
 }
 
@@ -179,6 +192,12 @@ static void ringClear() {
   ringR = 0;
   ringW = 0;
   portEXIT_CRITICAL(&audioMux);
+  portENTER_CRITICAL(&stMux);
+  stR = 0;
+  stW = 0;
+  portEXIT_CRITICAL(&stMux);
+  stPrev = 0;
+  stFrac = 0;
 }
 
 static void replayAppend(const uint8_t* data, size_t len) {
@@ -192,6 +211,8 @@ static void replayAppend(const uint8_t* data, size_t len) {
   memcpy(replayBytes + replayLen, data, len);
   replayLen += len;
 }
+
+static void stereoFromPcm(const uint8_t* data, size_t len);
 
 static void ringPush(const uint8_t* data, size_t len) {
   if (!audioRing || len < 2) return;
@@ -207,6 +228,7 @@ static void ringPush(const uint8_t* data, size_t len) {
   }
   portEXIT_CRITICAL(&audioMux);
   lastAudioMs = millis();
+  stereoFromPcm(data, len);
 }
 
 static size_t ringAvailSamples() {
@@ -277,69 +299,76 @@ static void onA2dpConn(esp_a2d_connection_state_t state, void*) {
   Serial.printf("bt lage %d\n", a2dpState);
 }
 
+static size_t stereoAvailFrames() {
+  portENTER_CRITICAL(&stMux);
+  size_t n = (stW + kStereoBytes - stR) % kStereoBytes;
+  portEXIT_CRITICAL(&stMux);
+  return n / 4;
+}
+
+static void stereoFromPcm(const uint8_t* data, size_t len) {
+  if (!stereoRing || len < 2) return;
+  size_t w = stW;
+  for (size_t i = 0; i + 1 < len; i += 2) {
+    int16_t cur = static_cast<int16_t>(data[i] | (static_cast<uint16_t>(data[i + 1]) << 8));
+    while (stFrac < 44100) {
+      int32_t mixed = stPrev + static_cast<int32_t>(((int64_t)(cur - stPrev) * stFrac) / 44100);
+      if (mixed > 32767) mixed = 32767;
+      if (mixed < -32768) mixed = -32768;
+      if ((w + 4) % kStereoBytes == stR) {
+        portENTER_CRITICAL(&stMux);
+        stR = (stR + 4) % kStereoBytes;
+        portEXIT_CRITICAL(&stMux);
+      }
+      int16_t sample = static_cast<int16_t>(mixed);
+      stereoRing[w] = static_cast<uint8_t>(sample);
+      stereoRing[w + 1] = static_cast<uint8_t>(static_cast<uint16_t>(sample) >> 8);
+      stereoRing[w + 2] = stereoRing[w];
+      stereoRing[w + 3] = stereoRing[w + 1];
+      w = (w + 4) % kStereoBytes;
+      stFrac += 16000;
+    }
+    stFrac -= 44100;
+    stPrev = cur;
+  }
+  portENTER_CRITICAL(&stMux);
+  stW = w;
+  portEXIT_CRITICAL(&stMux);
+}
+
 static int32_t fillAirpods(Frame* frame, int32_t count) {
-  static int32_t phase = 0;
-  static int16_t s0 = 0;
-  static int16_t s1 = 0;
   static bool primed = false;
-  static int hold = 0;
-  // Relay chunks are about 100 ms. 80 ms of silence used to look like the
-  // end of the sentence, so playback started thin and then ran dry. 600 ms
-  // covers a late chunk. A hole after that resumes as soon as audio returns,
-  // instead of waiting out another full buffer.
-  constexpr size_t kPrimeSamples = 9600;
+  constexpr size_t kPrimeFrames = 26460;
   constexpr unsigned long kGapMs = 250;
-  constexpr int kHoldFrames = 44100 / 40;
-  if (pttHeld || !airpodsOn()) {
+  if (!stereoRing || pttHeld || !airpodsOn()) {
     primed = false;
-    phase = 0;
-    hold = 0;
-    s0 = 0;
-    s1 = 0;
     for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
     return count;
   }
+  size_t have = stereoAvailFrames();
+  bool ended = lastAudioMs != 0 && millis() - lastAudioMs > kGapMs;
   if (!primed) {
-    size_t avail = ringAvailSamples();
-    bool ended = lastAudioMs != 0 && millis() - lastAudioMs > kGapMs;
-    if (avail == 0 || (avail < kPrimeSamples && !ended)) {
+    if (have == 0 || (have < kPrimeFrames && !ended)) {
       for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
       return count;
     }
     primed = true;
-    hold = 0;
-    s0 = 0;
-    if (ringPullSamples(&s1, 1) != 1) s1 = 0;
   }
-  for (int32_t i = 0; i < count; i++) {
-    if (!primed) {
-      frame[i].channel1 = frame[i].channel2 = 0;
-      continue;
-    }
-    int32_t mixed = s0 + static_cast<int32_t>(((int64_t)(s1 - s0) * phase) / 44100);
-    if (mixed > 32767) mixed = 32767;
-    if (mixed < -32768) mixed = -32768;
-    frame[i].channel1 = frame[i].channel2 = static_cast<int16_t>(mixed);
-    phase += 16000;
-    while (phase >= 44100) {
-      phase -= 44100;
-      s0 = s1;
-      if (ringPullSamples(&s1, 1) == 1) {
-        hold = 0;
-        continue;
-      }
-      if (hold < kHoldFrames) {
-        s1 = s0;
-        hold++;
-        continue;
-      }
-      s1 = 0;
-      if (s0 == 0 && (lastAudioMs == 0 || millis() - lastAudioMs > kGapMs)) {
-        primed = false;
-        phase = 0;
-        hold = 0;
-      }
-    }
+  size_t n = have < static_cast<size_t>(count) ? have : static_cast<size_t>(count);
+  size_t r = stR;
+  for (size_t i = 0; i < n; i++) {
+    size_t o = (r + i * 4) % kStereoBytes;
+    int16_t sample = static_cast<int16_t>(stereoRing[o] | (static_cast<uint16_t>(stereoRing[o + 1]) << 8));
+    frame[i].channel1 = frame[i].channel2 = sample;
+  }
+  for (size_t i = n; i < static_cast<size_t>(count); i++) frame[i].channel1 = frame[i].channel2 = 0;
+  if (n > 0) {
+    size_t next = (r + n * 4) % kStereoBytes;
+    portENTER_CRITICAL(&stMux);
+    if (stR == r) stR = next;
+    portEXIT_CRITICAL(&stMux);
+  } else if (ended) {
+    primed = false;
   }
   return count;
 }
@@ -367,10 +396,12 @@ static void serviceAirpods() {
   uiDirty = true;
   if (now == ESP_A2D_CONNECTION_STATE_CONNECTED) {
     Serial.printf("bt kopplad %s\n", a2dpName);
+    esp_coex_preference_set(ESP_COEX_PREFER_BT);
     if (!pttHeld) releaseSpeaker();
   } else if (prev == ESP_A2D_CONNECTION_STATE_CONNECTED &&
              now == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     Serial.println("bt slapp");
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
     if (!pttHeld) startSpeaker();
   }
 }
@@ -904,6 +935,7 @@ static void beginPtt() {
   pttHeld = true;
   capQueued = false;
   ringClear();
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
   M5.Speaker.stop();
   if (airpodsOn() && !useSpk2 && !M5.Speaker.isRunning()) startSpeaker();
   if (useSpk2) {
@@ -933,6 +965,7 @@ static void endPtt() {
   capQueued = false;
   M5.Mic.end();
   if (sessionReady) sendPtt("up");
+  if (airpodsOn()) esp_coex_preference_set(ESP_COEX_PREFER_BT);
   if (airpodsOn()) {
     if (!useSpk2) {
       if (!M5.Speaker.isRunning()) startSpeaker();
@@ -1175,7 +1208,7 @@ static void serviceSerial() {
 static void servicePlayback() {
   if (airpodsOn()) {
     if (!pttHeld && M5.Speaker.isRunning()) releaseSpeaker();
-    if (state == RunState::Speak && ringAvailSamples() == 0 && millis() - lastAudioMs > 200) {
+    if (state == RunState::Speak && stereoAvailFrames() == 0 && millis() - lastAudioMs > 200) {
       setState(RunState::Idle);
     }
     return;
