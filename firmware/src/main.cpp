@@ -282,9 +282,18 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
   static int16_t s0 = 0;
   static int16_t s1 = 0;
   static bool primed = false;
+  static int hold = 0;
+  // Relay chunks are about 100 ms. 80 ms of silence used to look like the
+  // end of the sentence, so playback started thin and then ran dry. 600 ms
+  // covers a late chunk. A hole after that resumes as soon as audio returns,
+  // instead of waiting out another full buffer.
+  constexpr size_t kPrimeSamples = 9600;
+  constexpr unsigned long kGapMs = 250;
+  constexpr int kHoldFrames = 44100 / 40;
   if (pttHeld || !airpodsOn()) {
     primed = false;
     phase = 0;
+    hold = 0;
     s0 = 0;
     s1 = 0;
     for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
@@ -292,16 +301,13 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
   }
   if (!primed) {
     size_t avail = ringAvailSamples();
-    bool stale = lastAudioMs != 0 && millis() - lastAudioMs > 80 && avail > 0;
-    if (avail < 3200 && !stale) {
-      for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
-      return count;
-    }
-    if (avail == 0) {
+    bool ended = lastAudioMs != 0 && millis() - lastAudioMs > kGapMs;
+    if (avail == 0 || (avail < kPrimeSamples && !ended)) {
       for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
       return count;
     }
     primed = true;
+    hold = 0;
     s0 = 0;
     if (ringPullSamples(&s1, 1) != 1) s1 = 0;
   }
@@ -318,9 +324,20 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
     while (phase >= 44100) {
       phase -= 44100;
       s0 = s1;
-      if (ringPullSamples(&s1, 1) != 1) {
-        s1 = 0;
-        if (s0 == 0) primed = false;
+      if (ringPullSamples(&s1, 1) == 1) {
+        hold = 0;
+        continue;
+      }
+      if (hold < kHoldFrames) {
+        s1 = s0;
+        hold++;
+        continue;
+      }
+      s1 = 0;
+      if (s0 == 0 && (lastAudioMs == 0 || millis() - lastAudioMs > kGapMs)) {
+        primed = false;
+        phase = 0;
+        hold = 0;
       }
     }
   }
