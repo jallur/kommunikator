@@ -320,6 +320,14 @@ class KommA2dp : public BluetoothA2DPSource {
 
   void noteConnected() { pageFails = 0; }
 
+  // SUSPEND leaves this at STARTED, and a later START is then ignored.
+  // The ack only restarts the stream when the state machine is waiting for it.
+  esp_err_t kickMedia() {
+    if (s_media_state == 0) return esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+    s_media_state = 1;
+    return esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+  }
+
  protected:
   void bt_app_av_state_unconnected_hdlr(uint16_t event, void* param) override {
     if (event == kA2dpHeartBeat && pageFails >= 1 && !pttHeld &&
@@ -395,18 +403,22 @@ static void setAirpodMedia(bool run) {
       a2dpMediaWant = true;
       return;
     }
-    if (a2dpMediaWant && millis() - a2dpCmdMs < 500) return;
-  } else if (!a2dpMediaOn) {
-    a2dpMediaWant = false;
-    return;
-  } else if (!a2dpMediaWant && millis() - a2dpCmdMs < 500) {
+    if (a2dpMediaWant && millis() - a2dpCmdMs < 1000) return;
+    a2dpMediaWant = true;
+    a2dpCmdMs = millis();
+    esp_err_t err = a2dp.kickMedia();
+    Serial.printf("bt media redo %d on %d\n", static_cast<int>(err), a2dpMediaOn ? 1 : 0);
     return;
   }
-  a2dpMediaWant = run;
+  if (!a2dpMediaOn) {
+    a2dpMediaWant = false;
+    return;
+  }
+  if (!a2dpMediaWant && millis() - a2dpCmdMs < 500) return;
+  a2dpMediaWant = false;
   a2dpCmdMs = millis();
-  esp_err_t err = esp_a2d_media_ctrl(run ? ESP_A2D_MEDIA_CTRL_START : ESP_A2D_MEDIA_CTRL_SUSPEND);
-  Serial.printf("bt media %s %d on %d\n", run ? "start" : "paus", static_cast<int>(err),
-                a2dpMediaOn ? 1 : 0);
+  esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+  Serial.printf("bt media paus %d on %d\n", static_cast<int>(err), a2dpMediaOn ? 1 : 0);
 }
 #else
 static void setAirpodMedia(bool) {}
@@ -491,6 +503,10 @@ static size_t stereoAvailFrames() {
 }
 
 static void stereoFromPcm(const uint8_t* data, size_t len) {
+  // While the buds are down the buzzer owns the reply. Keeping a stereo
+  // copy made that same ending play again, seconds after the screen and
+  // the buzzer had already finished.
+  if (!airpodsOn()) return;
   if (!stereoRing || len < 2) return;
   size_t w = stW;
   for (size_t i = 0; i + 1 < len; i += 2) {
@@ -523,10 +539,14 @@ static void stereoFromPcm(const uint8_t* data, size_t len) {
 
 #if KOMM_A2DP
 static int32_t fillAirpods(Frame* frame, int32_t count) {
-  if (!stereoRing || pttHeld || !airpodsOn() || !airpodLatched || count <= 0) {
+  if (!stereoRing || count <= 0) {
     fillEmptyCalls++;
     return 0;
   }
+  // The wrapper already zeroed the buffer. Returning zero here makes the
+  // stack drop the stream it just started, so an idle pull stays silent
+  // instead of ending the session.
+  if (pttHeld || !airpodLatched) return count;
   // The wrapper already zeroed the buffer. Spend the opening of a new stream
   // on that silence so the decoder locks before any word is sent.
   int32_t filled = 0;
@@ -616,6 +636,12 @@ static void serviceAirpods() {
   } else if (prev == ESP_A2D_CONNECTION_STATE_CONNECTED &&
              now == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     Serial.println("bt slapp");
+    portENTER_CRITICAL(&stMux);
+    stR = 0;
+    stW = 0;
+    portEXIT_CRITICAL(&stMux);
+    airpodLatched = false;
+    airpodPrerollLeft = 0;
     if (state != RunState::Wifi) esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     if (!pttHeld) startSpeaker();
   }
@@ -1720,7 +1746,9 @@ static void beginPtt() {
   capLive = false;
   ringClear();
   setAirpodMedia(false);
-  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  // Wi-Fi priority drops the AirPods link while the microphone is open.
+  // The socket still has to move, so share the radio when the buds are up.
+  esp_coex_preference_set(airpodsOn() ? ESP_COEX_PREFER_BALANCE : ESP_COEX_PREFER_WIFI);
   logAudio("rensar");
   M5.Speaker.stop();
   // AirPods already own the radio. Starting the buzzer I2S here asks for
@@ -1761,7 +1789,7 @@ static void abortActivity() {
   M5.Speaker.stop();
   ringClear();
   setAirpodMedia(false);
-  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  esp_coex_preference_set(airpodsOn() ? ESP_COEX_PREFER_BALANCE : ESP_COEX_PREFER_WIFI);
   if (wasPtt && sessionReady) sendPtt("up");
   if (!airpodsOn() && !M5.Speaker.isRunning()) startSpeaker();
   setupOpen = false;
@@ -2227,14 +2255,11 @@ static void servicePlayback() {
       logAudio(feed ? "spela" : "vantar");
     }
     setAirpodMedia(feed);
-    // beginPtt forces Wi-Fi. A change-only check would leave that in place
-    // if the last playback mode was already "balance", so drop the memory
-    // whenever the stream is closed and apply balance again when it opens.
-    // Preferring Bluetooth here starved the socket and cut the reply.
+    // Stay in balance for the whole time the buds are connected, including
+    // the wait after the button. Wi-Fi priority during that wait is what
+    // drops the link before the answer arrives.
     static int coexMode = -1;
-    if (!feed) {
-      coexMode = -1;
-    } else if (coexMode != 2) {
+    if (coexMode != 2) {
       coexMode = 2;
       esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
       Serial.println("ljud radio balans");
