@@ -72,6 +72,20 @@ static bool capQueued = false;
 static bool capLive = false;
 static bool micOpen = false;
 static size_t capFill = 0;
+static uint32_t micSent = 0;
+static uint32_t micQuietMs = 0;
+static uint32_t micDrop = 0;
+static bool micRestarted = false;
+// One second of 16 kHz, so a slow socket write cannot stall the DMA.
+static constexpr size_t kMicRing = 16000;
+static int16_t micRing[kMicRing];
+static volatile size_t micW = 0;
+static volatile size_t micR = 0;
+static portMUX_TYPE micMux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t micTaskHandle = nullptr;
+static volatile bool micRun = false;
+static volatile bool micInRead = false;
+static bool micTaskOn = false;
 static uint32_t listenSince = 0;
 static uint32_t thinkSince = 0;
 static int16_t capBuf[CAPTURE_SAMPLES];
@@ -451,13 +465,13 @@ static int32_t fillAirpods(Frame* frame, int32_t count) {
 static void logAudio(const char* why) {
   unsigned age = lastAudioMs == 0 ? 0u : static_cast<unsigned>(millis() - lastAudioMs);
   Serial.printf(
-      "ljud %s mono %u stereo %u ut %u tom %u tapS %u tapM %u media %d/%d ptt %d btn %d mic %u alder %u %s\n",
+      "ljud %s mono %u stereo %u ut %u tom %u tapS %u tapM %u media %d/%d ptt %d btn %d mic %u upp %u alder %u %s\n",
       why, static_cast<unsigned>(ringAvailSamples()), static_cast<unsigned>(stereoAvailFrames()),
       static_cast<unsigned>(fillOutFrames), static_cast<unsigned>(fillEmptyCalls),
       static_cast<unsigned>(stereoDropFrames), static_cast<unsigned>(monoDropSamples),
       a2dpMediaOn ? 1 : 0, a2dpMediaWant ? 1 : 0, pttHeld ? 1 : 0,
       gpio_get_level(static_cast<gpio_num_t>(PIN_BTN_A)) == 0 ? 1 : 0,
-      static_cast<unsigned>(capFill), age, stateName(state));
+      static_cast<unsigned>(capFill), static_cast<unsigned>(micSent), age, stateName(state));
 }
 
 static void releaseSpeaker();
@@ -550,22 +564,93 @@ static bool startSpeaker() {
   return ok;
 }
 
+static void micResetRing() {
+  portENTER_CRITICAL(&micMux);
+  micW = 0;
+  micR = 0;
+  portEXIT_CRITICAL(&micMux);
+}
+
+static void micPush(const int16_t* src, size_t n) {
+  portENTER_CRITICAL(&micMux);
+  for (size_t i = 0; i < n; i++) {
+    size_t next = (micW + 1) % kMicRing;
+    if (next == micR) {
+      micR = (micR + 1) % kMicRing;
+      micDrop++;
+    }
+    micRing[micW] = src[i];
+    micW = next;
+  }
+  portEXIT_CRITICAL(&micMux);
+}
+
+static size_t micPop(int16_t* dst, size_t maxn) {
+  portENTER_CRITICAL(&micMux);
+  size_t n = 0;
+  while (n < maxn && micR != micW) {
+    dst[n++] = micRing[micR];
+    micR = (micR + 1) % kMicRing;
+  }
+  portEXIT_CRITICAL(&micMux);
+  return n;
+}
+
+static void micWaitIdle() {
+  for (int i = 0; i < 40 && micInRead; i++) delay(2);
+}
+
+static void micReader(void*) {
+  int16_t tmp[64];
+  for (;;) {
+    portENTER_CRITICAL(&micMux);
+    bool run = micRun;
+    if (run) micInRead = true;
+    portEXIT_CRITICAL(&micMux);
+    if (!run) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+      continue;
+    }
+    size_t got = 0;
+    i2s_read(I2S_NUM_0, tmp, sizeof(tmp), &got, pdMS_TO_TICKS(10));
+    if (got >= sizeof(int16_t)) micPush(tmp, got / sizeof(int16_t));
+    micInRead = false;
+    if (got < sizeof(int16_t)) vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+static void startMicTask() {
+  if (micTaskHandle != nullptr) return;
+  if (xTaskCreatePinnedToCore(micReader, "mic", 4096, nullptr, 4, &micTaskHandle, 1) != pdPASS) {
+    micTaskHandle = nullptr;
+    Serial.println("mic task nej");
+    return;
+  }
+  micTaskOn = true;
+  Serial.println("mic task");
+}
+
 static void stopMic() {
+  portENTER_CRITICAL(&micMux);
+  micRun = false;
+  portEXIT_CRITICAL(&micMux);
   capFill = 0;
   capQueued = false;
   capLive = false;
   if (!micOpen) return;
-  micOpen = false;
   i2s_stop(I2S_NUM_0);
+  micWaitIdle();
   i2s_driver_uninstall(I2S_NUM_0);
+  micOpen = false;
 }
 
 static bool startMic() {
   stopMic();
   releaseSpeaker();
   M5.Mic.end();
-  // SPM1423 is PDM, and this ESP32 only has PDM on I2S0. Four short DMA
-  // buffers stay in internal RAM while Bluetooth and TLS already hold most of it.
+  // SPM1423 is PDM, and this ESP32 only has PDM on I2S0. A short DMA
+  // queue overflows while the main loop draws or writes TLS, and the
+  // driver then stays silent until it is started again.
   i2s_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
   cfg.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
@@ -574,30 +659,72 @@ static bool startMic() {
   cfg.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  cfg.dma_buf_count = 4;
   cfg.dma_buf_len = 64;
   i2s_pin_config_t pins;
   memset(&pins, 0xff, sizeof(pins));
   pins.ws_io_num = PIN_MIC_CLK;
   pins.data_in_num = PIN_MIC_DATA;
-  esp_err_t err = i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
-  if (err != ESP_OK) {
-    Serial.printf("mic install %d intern %u storst %u\n", static_cast<int>(err),
+  const int dmaCounts[] = {16, 8, 4};
+  esp_err_t err = ESP_FAIL;
+  for (int count : dmaCounts) {
+    cfg.dma_buf_count = count;
+    err = i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
+    if (err == ESP_OK) {
+      Serial.printf("mic dma %d\n", count);
+      break;
+    }
+    i2s_driver_uninstall(I2S_NUM_0);
+    Serial.printf("mic install %d antal %d intern %u storst %u\n", static_cast<int>(err), count,
                   static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)));
-    i2s_driver_uninstall(I2S_NUM_0);
-    return false;
   }
+  if (err != ESP_OK) return false;
   err = i2s_set_pin(I2S_NUM_0, &pins);
   if (err != ESP_OK) {
     Serial.printf("mic pin %d\n", static_cast<int>(err));
     i2s_driver_uninstall(I2S_NUM_0);
     return false;
   }
+  i2s_start(I2S_NUM_0);
+  micResetRing();
   micOpen = true;
+  micSent = 0;
+  micDrop = 0;
+  micQuietMs = millis();
+  micRestarted = false;
+  portENTER_CRITICAL(&micMux);
+  micRun = true;
+  portEXIT_CRITICAL(&micMux);
+  if (micTaskHandle != nullptr) xTaskNotifyGive(micTaskHandle);
   Serial.printf("mic igang intern %u\n",
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
   return true;
+}
+
+static bool wsCanSend();
+
+static bool sendCapture(size_t samples) {
+  if (samples < 2 || !sessionReady) return false;
+  if (!wsCanSend()) return false;
+  size_t bytes = samples * sizeof(int16_t);
+  if (!webSocket.sendBIN(reinterpret_cast<uint8_t*>(capBuf), bytes)) return false;
+  micSent += bytes;
+  if (micSent == bytes) Serial.printf("mic skick %u\n", static_cast<unsigned>(bytes));
+  return true;
+}
+
+static void flushCapture() {
+  if (capFill >= 2) {
+    uint32_t start = millis();
+    while (!wsCanSend() && millis() - start < 150) delay(5);
+    size_t samples = capFill;
+    if (!sendCapture(samples)) {
+      Serial.printf("mic ej skick %u\n", static_cast<unsigned>(samples));
+    } else {
+      capFill = 0;
+    }
+  }
+  Serial.printf("mic tot %u tap %u\n", static_cast<unsigned>(micSent), static_cast<unsigned>(micDrop));
 }
 
 static void chirpLedc(bool releaseChirp) {
@@ -1194,9 +1321,23 @@ static void abortActivity() {
   logAudio("avbryt");
 }
 
+static bool drainMic();
+
 static void endPtt() {
   if (!pttHeld) return;
   pttHeld = false;
+  listenLive = false;
+  // Stop the reader and let it push the last DMA block before the relay
+  // sees ptt up. stopMic() drops capFill, so the send has to happen first.
+  if (micTaskOn) {
+    portENTER_CRITICAL(&micMux);
+    micRun = false;
+    portEXIT_CRITICAL(&micMux);
+    if (micOpen) i2s_stop(I2S_NUM_0);
+    micWaitIdle();
+  }
+  drainMic();
+  flushCapture();
   capQueued = false;
   capLive = false;
   stopMic();
@@ -1207,7 +1348,6 @@ static void endPtt() {
     chirp(true);
   }
   setState(sessionReady ? RunState::Think : RunState::Idle);
-  listenLive = false;
   markActivity();
 }
 
@@ -1376,30 +1516,67 @@ static void draw() {
   uiDirty = false;
 }
 
+static size_t takeCaptured(int16_t* dst, size_t maxn) {
+  if (micTaskOn) return micPop(dst, maxn);
+  size_t got = 0;
+  i2s_read(I2S_NUM_0, dst, maxn * sizeof(int16_t), &got, 0);
+  return got / sizeof(int16_t);
+}
+
+static bool drainMic() {
+  if (!micOpen && !micTaskOn) return false;
+  int16_t tmp[64];
+  bool any = false;
+  for (int spins = 0; spins < 48; spins++) {
+    if (capFill >= CAPTURE_SAMPLES) {
+      if (!sendCapture(capFill)) return any;
+      capFill = 0;
+      capLive = true;
+    }
+    size_t samples = takeCaptured(tmp, 64);
+    if (samples == 0) break;
+    any = true;
+    micQuietMs = millis();
+    micRestarted = false;
+    for (size_t i = 0; i < samples; i++) {
+      if (capFill >= CAPTURE_SAMPLES) {
+        if (!sendCapture(capFill)) return true;
+        capFill = 0;
+        capLive = true;
+      }
+      int32_t sample = static_cast<int32_t>(tmp[i]) << 4;
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+      capBuf[capFill++] = static_cast<int16_t>(sample);
+    }
+  }
+  if (capFill >= CAPTURE_SAMPLES && sendCapture(capFill)) {
+    capFill = 0;
+    capLive = true;
+  }
+  return any;
+}
+
 static void serviceCapture() {
-  if (!pttHeld || !sessionReady || !micOpen) return;
+  if (!pttHeld || !micOpen) return;
   if ((GPIO.in1.data & (1UL << (GPIO_NUM_35 - 32))) == 0) {
     abortActivity();
     return;
   }
-  int16_t tmp[64];
-  size_t got = 0;
-  i2s_read(I2S_NUM_0, tmp, sizeof(tmp), &got, 0);
-  size_t samples = got / sizeof(int16_t);
-  for (size_t i = 0; i < samples && capFill < CAPTURE_SAMPLES; i++) {
-    int32_t sample = static_cast<int32_t>(tmp[i]) << 4;
-    if (sample > 32767) sample = 32767;
-    if (sample < -32768) sample = -32768;
-    capBuf[capFill++] = static_cast<int16_t>(sample);
-  }
-  if (capFill < CAPTURE_SAMPLES) return;
-  if (!wsCanSend()) {
-    capFill = 0;
+  if (!sessionReady) {
+    int16_t trash[64];
+    for (int i = 0; i < 8; i++) {
+      if (takeCaptured(trash, 64) == 0) break;
+    }
     return;
   }
-  webSocket.sendBIN(reinterpret_cast<uint8_t*>(capBuf), sizeof(capBuf));
-  capFill = 0;
-  capLive = true;
+  if (drainMic()) return;
+  if (micRestarted || millis() - micQuietMs < 50) return;
+  i2s_stop(I2S_NUM_0);
+  i2s_start(I2S_NUM_0);
+  micRestarted = true;
+  micQuietMs = millis();
+  Serial.println("mic omstart");
 }
 
 static void printAudio() {
@@ -1672,6 +1849,7 @@ void setup() {
   Serial.println("ljud: t ton, p senaste, v 0-255, r takt, m 1-64, ?");
   printAudio();
   markActivity();
+  startMicTask();
   startAirpods();
 
   M5.update();
@@ -1744,6 +1922,7 @@ void loop() {
   if (state == RunState::Wifi) {
     if (WiFi.status() == WL_CONNECTED) startWebSocket();
   } else if (wsStarted) {
+    if (pttHeld) serviceCapture();
     webSocket.loop();
   }
   if (setupOpen) {
