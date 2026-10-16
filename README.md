@@ -66,16 +66,11 @@ python -m platformio device monitor
 
 Wi-Fi kan också sättas på enheten: håll knapp B inne vid start, eller starta utan sparat nät. Anslut till AP `Kommunikator` och öppna `http://192.168.4.1`. Formuläret sparar nät, relay och token i NVS.
 
-Användning: knapp A inne medan du pratar, släpp när du är klar. Pip vid tryck och släpp. Svaret spelas i summern och skrivs på skärmen. Knapp B växlar till Hat SPK2 när den finns. Efter tre minuter i vila släcker den skärmen och lättsover. Knapp A väcker.
+Användning: knapp A inne medan du pratar, släpp när du är klar. Pip vid tryck och släpp. Svaret spelas i summern och skrivs på skärmen. Kopplas AirPods går svaret dit i stället, och skärmen visar `AIR`. Knapp B växlar till Hat SPK2 när den finns. Efter tre minuter i vila släcker den skärmen. Lättsömn väntar tills lurarna är frånkopplade. Knapp A väcker.
 
-AirPods-testet är en egen skiss. Den ersätter röstprogrammet tills `m5stick-c-plus2` laddas upp igen. Öppna fodralet och håll knappen på baksidan tills lampan blinkar vitt. Stickan kopplar till första enheten vars namn innehåller "AirPod" och spelar en ton, en paus och en mörkare ton.
+Öppna fodralet och håll knappen på baksidan tills lampan blinkar vitt, första gången. Sedan räcker det att lurarna är ute ur fodralet. Stickan tar första enheten vars namn innehåller "AirPod".
 
-```bash
-cd firmware
-python -m platformio run -e airpods-test -t upload
-python -m platformio device monitor
-python -m platformio run -e m5stick-c-plus2 -t upload
-```
+`airpods-test` är bara tonen, utan röst. Den vanliga uppladdningen är `m5stick-c-plus2`.
 
 ## Tester
 

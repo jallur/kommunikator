@@ -15,6 +15,9 @@
 #include <esp_sleep.h>
 #include <driver/i2s.h>
 #include <driver/rtc_io.h>
+#include <esp_heap_caps.h>
+
+#include <BluetoothA2DPSource.h>
 
 #include <cmath>
 #include <cstring>
@@ -57,12 +60,12 @@ static KommSocket webSocket;
 static RunState state = RunState::Boot;
 static bool useSpk2 = true;
 static bool sessionReady = false;
-static bool pttHeld = false;
+static volatile bool pttHeld = false;
 static bool wsStarted = false;
 static bool speakerI2sLive = false;
 static bool capQueued = false;
 static int16_t capBuf[CAPTURE_SAMPLES];
-static bool uiDirty = true;
+static volatile bool uiDirty = true;
 
 static String wifiSsid;
 static String wifiPass;
@@ -83,7 +86,7 @@ static unsigned long lastBatteryMs = 0;
 // every later sample was swapped and the buzzer turned into noise. 56 KB is
 // what still fits in DRAM: about 1.7 s. Past that, whole samples are dropped.
 static constexpr size_t kRingBytes = 56 * 1024;
-static uint8_t audioRing[kRingBytes];
+static uint8_t* audioRing = nullptr;
 static size_t ringR = 0;
 static size_t ringW = 0;
 static unsigned long lastAudioMs = 0;
@@ -157,6 +160,15 @@ static void foldUtf8(String& out, const char* utf8, size_t limit) {
 
 static void markActivity() { lastActivity = millis(); }
 
+static bool allocRing() {
+  audioRing = static_cast<uint8_t*>(heap_caps_malloc(kRingBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!audioRing) audioRing = static_cast<uint8_t*>(malloc(kRingBytes));
+  if (!audioRing) return false;
+  Serial.printf("ljud ring %u %s\n", static_cast<unsigned>(kRingBytes),
+                esp_ptr_external_ram(audioRing) ? "psram" : "dram");
+  return true;
+}
+
 static size_t ringCountHeld() {
   return (ringW + kRingBytes - ringR) % kRingBytes;
 }
@@ -181,7 +193,7 @@ static void replayAppend(const uint8_t* data, size_t len) {
 }
 
 static void ringPush(const uint8_t* data, size_t len) {
-  if (len < 2) return;
+  if (!audioRing || len < 2) return;
   len &= ~size_t{1};
   if (captureReplay) replayAppend(data, len);
   portENTER_CRITICAL(&audioMux);
@@ -204,6 +216,7 @@ static size_t ringAvailSamples() {
 }
 
 static size_t ringPullSamples(int16_t* dest, size_t maxSamples) {
+  if (!audioRing) return 0;
   size_t got = 0;
   portENTER_CRITICAL(&audioMux);
   while (got < maxSamples && ringCountHeld() >= 2) {
@@ -215,6 +228,133 @@ static size_t ringPullSamples(int16_t* dest, size_t maxSamples) {
   }
   portEXIT_CRITICAL(&audioMux);
   return got;
+}
+
+// AirPods Pro 1 speak classic A2DP (SBC). The stick is the source. The mic
+// stays on the stick. While the buds are connected the buzzer is quiet and
+// this callback turns the 16 kHz reply into 44.1 kHz stereo.
+static BluetoothA2DPSource a2dp;
+static volatile int a2dpState = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
+static int appliedA2dp = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
+static char a2dpName[48] = "";
+
+static bool airpodsOn() {
+  return a2dpState == ESP_A2D_CONNECTION_STATE_CONNECTED;
+}
+
+static uint8_t avrcpVolume() {
+  return static_cast<uint8_t>((static_cast<uint16_t>(playVolume) * 127) / 255);
+}
+
+static bool containsAirpod(const char* name) {
+  if (name == nullptr) return false;
+  char buf[48];
+  size_t n = strlen(name);
+  if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+  for (size_t i = 0; i < n; i++) {
+    char c = name[i];
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    buf[i] = c;
+  }
+  buf[n] = '\0';
+  return strstr(buf, "airpod") != nullptr;
+}
+
+static bool pickAirpod(const char* name, esp_bd_addr_t, int rssi) {
+  if (name == nullptr || name[0] == '\0') return false;
+  Serial.printf("bt namn %s rssi %d\n", name, rssi);
+  if (!containsAirpod(name)) return false;
+  strncpy(a2dpName, name, sizeof(a2dpName) - 1);
+  a2dpName[sizeof(a2dpName) - 1] = '\0';
+  Serial.printf("bt val %s\n", a2dpName);
+  return true;
+}
+
+static void onA2dpConn(esp_a2d_connection_state_t state, void*) {
+  a2dpState = static_cast<int>(state);
+  uiDirty = true;
+  Serial.printf("bt lage %d\n", a2dpState);
+}
+
+static int32_t fillAirpods(Frame* frame, int32_t count) {
+  static int32_t phase = 0;
+  static int16_t s0 = 0;
+  static int16_t s1 = 0;
+  static bool primed = false;
+  if (pttHeld || !airpodsOn()) {
+    primed = false;
+    phase = 0;
+    s0 = 0;
+    s1 = 0;
+    for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
+    return count;
+  }
+  if (!primed) {
+    size_t avail = ringAvailSamples();
+    bool stale = lastAudioMs != 0 && millis() - lastAudioMs > 80 && avail > 0;
+    if (avail < 3200 && !stale) {
+      for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
+      return count;
+    }
+    if (avail == 0) {
+      for (int32_t i = 0; i < count; i++) frame[i].channel1 = frame[i].channel2 = 0;
+      return count;
+    }
+    primed = true;
+    s0 = 0;
+    if (ringPullSamples(&s1, 1) != 1) s1 = 0;
+  }
+  for (int32_t i = 0; i < count; i++) {
+    if (!primed) {
+      frame[i].channel1 = frame[i].channel2 = 0;
+      continue;
+    }
+    int32_t mixed = s0 + static_cast<int32_t>(((int64_t)(s1 - s0) * phase) / 44100);
+    if (mixed > 32767) mixed = 32767;
+    if (mixed < -32768) mixed = -32768;
+    frame[i].channel1 = frame[i].channel2 = static_cast<int16_t>(mixed);
+    phase += 16000;
+    while (phase >= 44100) {
+      phase -= 44100;
+      s0 = s1;
+      if (ringPullSamples(&s1, 1) != 1) {
+        s1 = 0;
+        if (s0 == 0) primed = false;
+      }
+    }
+  }
+  return count;
+}
+
+static void releaseSpeaker();
+static bool startSpeaker();
+
+static void startAirpods() {
+  Serial.println("bt start, satt AirPods i parning");
+  a2dp.set_local_name("Kommunikator");
+  a2dp.set_ssid_callback(pickAirpod);
+  a2dp.set_on_connection_state_changed(onA2dpConn, nullptr);
+  a2dp.set_auto_reconnect(true);
+  a2dp.set_ssp_enabled(true);
+  a2dp.set_reset_ble(true);
+  a2dp.set_volume(avrcpVolume());
+  a2dp.start(fillAirpods);
+}
+
+static void serviceAirpods() {
+  int now = a2dpState;
+  if (now == appliedA2dp) return;
+  int prev = appliedA2dp;
+  appliedA2dp = now;
+  uiDirty = true;
+  if (now == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+    Serial.printf("bt kopplad %s\n", a2dpName);
+    if (!pttHeld) releaseSpeaker();
+  } else if (prev == ESP_A2D_CONNECTION_STATE_CONNECTED &&
+             now == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+    Serial.println("bt slapp");
+    if (!pttHeld) startSpeaker();
+  }
 }
 
 static void releaseSpeaker() {
@@ -720,6 +860,7 @@ static void enterProvision() {
 static void beginWifi() {
   setState(RunState::Wifi);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   uiDirty = true;
 }
@@ -730,6 +871,7 @@ static void beginPtt() {
   capQueued = false;
   ringClear();
   M5.Speaker.stop();
+  if (airpodsOn() && !useSpk2 && !M5.Speaker.isRunning()) startSpeaker();
   if (useSpk2) {
     releaseSpeaker();
     chirp(false);
@@ -740,7 +882,7 @@ static void beginPtt() {
   if (!startMic()) {
     detailLine = "mic";
     pttHeld = false;
-    startSpeaker();
+    if (!airpodsOn()) startSpeaker();
     setState(RunState::Error);
     return;
   }
@@ -757,7 +899,15 @@ static void endPtt() {
   capQueued = false;
   M5.Mic.end();
   if (sessionReady) sendPtt("up");
-  if (useSpk2) {
+  if (airpodsOn()) {
+    if (!useSpk2) {
+      if (!M5.Speaker.isRunning()) startSpeaker();
+      chirp(true);
+      releaseSpeaker();
+    } else {
+      chirp(true);
+    }
+  } else if (useSpk2) {
     chirp(true);
     startSpeaker();
   } else {
@@ -771,8 +921,8 @@ static void endPtt() {
 static void toggleOutput() {
   useSpk2 = !useSpk2;
   prefs.putBool("spk2", useSpk2);
-  startSpeaker();
-  detailLine = useSpk2 ? "SPK2" : "summer";
+  if (!airpodsOn()) startSpeaker();
+  detailLine = airpodsOn() ? "AIR" : (useSpk2 ? "SPK2" : "summer");
   uiDirty = true;
   markActivity();
 }
@@ -804,8 +954,9 @@ static void draw() {
   M5.Display.setCursor(4, 2);
   M5.Display.printf("KOMM %s", stateName(state));
   char meta[24];
-  if (batteryMv > 0) snprintf(meta, sizeof(meta), "%dmV %s", batteryMv, useSpk2 ? "SPK2" : "SUM");
-  else snprintf(meta, sizeof(meta), "%s", useSpk2 ? "SPK2" : "SUM");
+  const char* outName = airpodsOn() ? "AIR" : (useSpk2 ? "SPK2" : "SUM");
+  if (batteryMv > 0) snprintf(meta, sizeof(meta), "%dmV %s", batteryMv, outName);
+  else snprintf(meta, sizeof(meta), "%s", outName);
   int metaW = M5.Display.textWidth(meta);
   M5.Display.setCursor(M5.Display.width() - metaW - 4, 2);
   M5.Display.print(meta);
@@ -865,7 +1016,7 @@ static void playSaved() {
     Serial.println("ljud inget sparat");
     return;
   }
-  if (!M5.Speaker.isRunning()) startSpeaker();
+  if (!airpodsOn() && !M5.Speaker.isRunning()) startSpeaker();
   captureReplay = false;
   ringClear();
   ringPush(replayBytes, replayLen);
@@ -878,7 +1029,7 @@ static void playTone() {
     Serial.println("ljud upptagen");
     return;
   }
-  if (!M5.Speaker.isRunning()) startSpeaker();
+  if (!airpodsOn() && !M5.Speaker.isRunning()) startSpeaker();
   captureReplay = false;
   ringClear();
   int16_t chunk[128];
@@ -936,6 +1087,7 @@ static void handleAudioCmd(char* line) {
     }
     playVolume = static_cast<uint8_t>(volume);
     if (M5.Speaker.isRunning()) M5.Speaker.setVolume(playVolume);
+    a2dp.set_volume(avrcpVolume());
     printAudio();
     return;
   }
@@ -947,7 +1099,7 @@ static void handleAudioCmd(char* line) {
       return;
     }
     playClock = static_cast<uint32_t>(rate);
-    if (!audioBusy()) startSpeaker();
+    if (!audioBusy() && !airpodsOn()) startSpeaker();
     printAudio();
     return;
   }
@@ -959,7 +1111,7 @@ static void handleAudioCmd(char* line) {
     }
     if (useSpk2) spk2Mag = static_cast<uint8_t>(mag);
     else buzzerMag = static_cast<uint8_t>(mag);
-    if (!audioBusy()) startSpeaker();
+    if (!audioBusy() && !airpodsOn()) startSpeaker();
     printAudio();
     return;
   }
@@ -987,6 +1139,13 @@ static void serviceSerial() {
 }
 
 static void servicePlayback() {
+  if (airpodsOn()) {
+    if (!pttHeld && M5.Speaker.isRunning()) releaseSpeaker();
+    if (state == RunState::Speak && ringAvailSamples() == 0 && millis() - lastAudioMs > 200) {
+      setState(RunState::Idle);
+    }
+    return;
+  }
   if (pttHeld || !M5.Speaker.isRunning()) return;
   // Keep both speaker slots full. A half-empty queue runs dry while the
   // screen redraws, which is the short silence in the middle of a reply.
@@ -1015,6 +1174,7 @@ static void maybeSleep() {
   unsigned long quiet = millis() - lastActivity;
   if (quiet > DIM_AFTER_MS) M5.Display.setBrightness(24);
   if (quiet < SLEEP_AFTER_MS) return;
+  if (a2dpState != ESP_A2D_CONNECTION_STATE_DISCONNECTED) return;
   setState(RunState::Boot);
   M5.Display.setBrightness(0);
   webSocket.disconnect();
@@ -1056,10 +1216,12 @@ void setup() {
   M5.Display.setTextWrap(false);
   M5.BtnB.setHoldThresh(700);
   speakerI2sLive = cfg.internal_spk || useSpk2;
+  if (!allocRing()) Serial.println("ljud ring saknas");
   startSpeaker();
   M5.Mic.end();
   replayCap = 32 * 1024;
-  replayBytes = static_cast<uint8_t*>(malloc(replayCap));
+  replayBytes = static_cast<uint8_t*>(heap_caps_malloc(replayCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!replayBytes) replayBytes = static_cast<uint8_t*>(malloc(replayCap));
   if (!replayBytes) {
     replayCap = 12 * 1024;
     replayBytes = static_cast<uint8_t*>(malloc(replayCap));
@@ -1069,6 +1231,7 @@ void setup() {
   Serial.println("ljud: t ton, p senaste, v 0-255, r takt, m 1-64, ?");
   printAudio();
   markActivity();
+  startAirpods();
 
   M5.update();
   bool forcePortal = M5.BtnB.isPressed() || wifiSsid.length() == 0;
@@ -1106,6 +1269,7 @@ void loop() {
     else if (M5.BtnB.wasClicked()) scrollAnswer();
   }
 
+  serviceAirpods();
   if (pttHeld) serviceCapture();
   servicePlayback();
 
