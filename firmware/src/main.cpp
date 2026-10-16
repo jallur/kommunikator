@@ -396,12 +396,12 @@ static void serviceAirpods() {
   uiDirty = true;
   if (now == ESP_A2D_CONNECTION_STATE_CONNECTED) {
     Serial.printf("bt kopplad %s\n", a2dpName);
-    esp_coex_preference_set(ESP_COEX_PREFER_BT);
+    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     if (!pttHeld) releaseSpeaker();
   } else if (prev == ESP_A2D_CONNECTION_STATE_CONNECTED &&
              now == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     Serial.println("bt slapp");
-    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     if (!pttHeld) startSpeaker();
   }
 }
@@ -965,7 +965,7 @@ static void endPtt() {
   capQueued = false;
   M5.Mic.end();
   if (sessionReady) sendPtt("up");
-  if (airpodsOn()) esp_coex_preference_set(ESP_COEX_PREFER_BT);
+  if (airpodsOn()) esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   if (airpodsOn()) {
     if (!useSpk2) {
       if (!M5.Speaker.isRunning()) startSpeaker();
@@ -1208,6 +1208,12 @@ static void serviceSerial() {
 static void servicePlayback() {
   if (airpodsOn()) {
     if (!pttHeld && M5.Speaker.isRunning()) releaseSpeaker();
+    bool playing = stereoAvailFrames() > 0 || state == RunState::Speak;
+    static bool btPreferred = false;
+    if (playing != btPreferred) {
+      btPreferred = playing;
+      esp_coex_preference_set(playing ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_BALANCE);
+    }
     if (state == RunState::Speak && stereoAvailFrames() == 0 && millis() - lastAudioMs > 200) {
       setState(RunState::Idle);
     }
