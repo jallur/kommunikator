@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from .settings import ALLOWED_PCM_RATES, Settings
@@ -68,6 +69,39 @@ def build_session_update(settings: Settings) -> dict:
             },
         },
     }
+
+
+def user_transcript(event: dict) -> tuple[str, bool] | None:
+    """Text of the user's audio, and whether this event is the final one.
+
+    The voice model does not read this text. grok-transcribe produces it on
+    the side, which is why the screen can show one question and the spoken
+    answer can be another.
+    """
+    kind = event.get("type")
+    if kind == "conversation.item.input_audio_transcription.updated":
+        return _text(event, "transcript", "text"), False
+    if kind == "conversation.item.input_audio_transcription.completed":
+        return _text(event, "transcript", "text"), True
+    return None
+
+
+def build_response_create(settings: Settings, transcript: str) -> dict:
+    """Ask for a reply to the transcribed utterance, not an earlier one.
+
+    response.create instructions replace the session prompt for this turn
+    only, so the session text is repeated and the quote is appended.
+    """
+    instructions = settings.xai_instructions
+    quote = transcript.strip()
+    if quote:
+        instructions += (
+            "\n\n## Latest utterance\n"
+            "The user just said, verbatim: "
+            + json.dumps(quote, ensure_ascii=False)
+            + "\nAnswer only that utterance. Do not answer an earlier question.\n"
+        )
+    return {"type": "response.create", "response": {"instructions": instructions}}
 
 
 def map_server_event(event: dict) -> list[dict]:

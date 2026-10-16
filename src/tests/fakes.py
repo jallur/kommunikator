@@ -16,6 +16,15 @@ class FakeLink:
         if event.get("type") == "session.update":
             await self.incoming.put(json.dumps({"type": "session.updated", "session": event["session"]}))
         elif event.get("type") == "input_audio_buffer.commit":
+            await self.incoming.put(
+                json.dumps(
+                    {
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": "Vad är 5 plus 5?",
+                    }
+                )
+            )
+        elif event.get("type") == "response.create":
             await self.incoming.put(json.dumps({"type": "response.created"}))
             await self.incoming.put(self.downlink_pcm)
             await self.incoming.put(

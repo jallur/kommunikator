@@ -108,7 +108,10 @@ def test_header_token_streams_audio_and_text(settings) -> None:
     assert texts[0]["type"] == "session.update"
     assert any(isinstance(item, bytes) and item for item in sent)
     assert {"type": "input_audio_buffer.commit"} in texts
-    assert {"type": "response.create"} in texts
+    created = [item for item in texts if item.get("type") == "response.create"]
+    assert created
+    assert texts.index({"type": "input_audio_buffer.commit"}) < texts.index(created[0])
+    assert "Vad är 5 plus 5?" in created[0]["response"]["instructions"]
     texts = [message["text"] for message in messages if message.get("text")]
     assert any("Hej" in text for text in texts)
     assert any(message.get("bytes") for message in messages)

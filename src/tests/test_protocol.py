@@ -3,7 +3,13 @@ import json
 import pytest
 
 from app.memory import ConversationMemory
-from app.protocol import ProtocolError, build_session_update, map_server_event, parse_hello
+from app.protocol import (
+    ProtocolError,
+    build_response_create,
+    build_session_update,
+    map_server_event,
+    parse_hello,
+)
 from app.settings import Settings
 from app.xai import realtime_url
 
@@ -51,6 +57,17 @@ def test_session_update_matches_documented_shape() -> None:
     assert "norska" in session["instructions"]
     assert "danska" in session["instructions"]
     assert "extremt kortfattat" in session["instructions"]
+
+
+def test_response_create_quotes_the_user_transcript() -> None:
+    settings = Settings(xai_api_key="secret-key", device_tokens=("t",))
+    payload = build_response_create(settings, 'Vad är 5 plus 5?')
+    text = payload["response"]["instructions"]
+    assert "Vad är 5 plus 5?" in text
+    assert "Answer only that utterance" in text
+    assert "extremt kortfattat" in text
+    bare = build_response_create(settings, "  ")
+    assert "Latest utterance" not in bare["response"]["instructions"]
 
 
 def test_realtime_url_is_the_documented_endpoint() -> None:
