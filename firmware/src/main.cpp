@@ -2259,8 +2259,10 @@ static void servicePlayback() {
     if (!pttHeld && M5.Speaker.isRunning()) releaseSpeaker();
     size_t queued = stereoAvailFrames();
     unsigned long age = lastAudioMs == 0 ? 100000ul : millis() - lastAudioMs;
-    // 600 ms at 44.1 kHz. Used only to open the stream, not to keep it open.
-    constexpr size_t kPrimeFrames = 26460;
+    // One second at 44.1 kHz, after the local upsample. Wi-Fi delivers the
+    // reply in bursts while the buds are playing, and this cushion covers
+    // the gap between bursts.
+    constexpr size_t kPrimeFrames = 44100;
     constexpr unsigned long kTailMs = 600;
     if (pttHeld) {
       airpodLatched = false;

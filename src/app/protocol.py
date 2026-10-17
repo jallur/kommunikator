@@ -46,8 +46,8 @@ def build_session_update(settings: Settings, output_rate: int | None = None) -> 
     turn_detection is JSON null, which is the documented manual-commit
     mode. The live API still emits speech_started and, for real speech,
     opens the response itself. {"type": null} was echoed back as {} and
-    did not disable that. output_rate is the device playback rate (44100
-    for AirPods). Omitted, the relay default is used.
+    did not disable that.     output_rate is the device playback rate. Plus2 asks for 16000 and
+    upsamples to 44100 for AirPods. Omitted, the relay default is used.
     """
     return {
         "type": "session.update",
