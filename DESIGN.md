@@ -27,6 +27,104 @@ Enheten pratar bara med relayn. Relayn öppnar xAI-socketen och håller API-nyck
 
 Relayn körs som Docker på cloud01, i `/home/grok/kommunikator`. Imagen byggs från `./src`. Tjänsten i `docker-compose.yml` heter `kommunikator-relay` och sitter på det externa nätet `proxy`, med `env_file: .env`. Jonas arbetsdator är inte värd. Enheten ansluter till `wss://trek.aldenback.com/ws` (port 443). TLS termineras på proxyn. Processen lyssnar på `0.0.0.0:8090`. Porten styrs av `PORT` i `.env` och är 8090 om variabeln saknas. Firmware litar på ISRG Root X1, så certet ska vara Let's Encrypt eller en kedja som slutar där.
 
+## Flöde
+
+Röst och text går i samma WebSocket, men i olika ramar. Binära ramar är PCM16. Text-ramar är JSON. Relayn översätter xAI:s händelser till enhetens typer och skickar aldrig API-nyckeln nedåt.
+
+```mermaid
+sequenceDiagram
+    participant Stick as StickC Plus2
+    participant Relay as Relay
+    participant XAI as xAI Realtime
+
+    Stick->>Relay: hello JSON
+    Relay->>XAI: session.update JSON
+    XAI-->>Relay: session.updated
+    Relay-->>Stick: hello.ok JSON
+
+    Stick->>Relay: ptt down JSON
+    Relay->>XAI: input_audio_buffer.clear
+    Note over Relay,XAI: pågående svar avbryts med response.cancel
+    loop medan knappen är nere
+        Stick->>Relay: PCM16 binärt
+        Relay->>XAI: PCM16 binärt
+    end
+    Stick->>Relay: ptt up JSON
+    Relay->>XAI: input_audio_buffer.commit
+    XAI-->>Relay: transcription.updated och completed
+    Relay-->>Stick: transcript.user JSON
+    Relay->>XAI: response.create med yttrandet citerat
+    XAI-->>Relay: response.created
+    Relay-->>Stick: status thinking
+    par röst och text i samma svar
+        XAI-->>Relay: PCM16 binärt
+        Relay-->>Stick: status speaking, sedan PCM16
+        XAI-->>Relay: output_audio_transcript.delta
+        Relay-->>Stick: transcript.assistant JSON
+    end
+    XAI-->>Relay: response.done
+    Relay-->>Stick: status idle
+```
+
+### Röst
+
+Mikrofonen och svaret är PCM. Texten styr inte ljudet. xAI hör de binära ramarna. Stickan spelar de binära ramarna som kommer tillbaka, efter att den själv samplat upp till 44,1 kHz för AirPods.
+
+```mermaid
+flowchart LR
+    subgraph upp [Upp]
+        Mic[SPM1423 PDM]
+        Cap[PCM16 mono 16 kHz]
+        UpFrame[binär ram till relayn]
+        XaiIn[xAI, binary input]
+        Mic --> Cap --> UpFrame --> XaiIn
+    end
+    subgraph ned [Ned]
+        XaiOut[xAI PCM16 16 kHz]
+        DownFrame[binär ram, högst 3200 byte]
+        StickBuf[ring på stickan]
+        Buds[AirPods, 44,1 kHz A2DP]
+        Buzz[summer, bara när lurarna är nere]
+        XaiOut --> DownFrame --> StickBuf
+        StickBuf --> Buds
+        StickBuf --> Buzz
+    end
+```
+
+Upp är redan 16 kHz, så relayn kopierar när `XAI_INPUT_RATE` också är 16000. Ned är den takt `hello.playback_rate` bad om. Plus2 ber om 16000. Relayn kopierar den takten och delar upp i ramar under 15 KiB. Första ljudramen kommer först efter `status speaking` för samma tur. Ljud som kommer innan dess, eller efter `response.done`, släpps.
+
+AirPods spelar stereoringen. Summern har en egen mono-kopia. Den töms när lurarna släpper, så ett redan spelat svar inte berättas om.
+
+### Text
+
+Transkriptet är ett sidospår. `grok-transcribe` skriver användarens text. Röstmodellen hör ljudet, och relayn citerar den färdiga texten i `response.create` så svaret gäller det yttrandet. Skärmen visar JSON. Den spelar inte texten.
+
+```mermaid
+flowchart TB
+    subgraph anvandare [Användaren]
+        Live[transcription.updated, kumulativ]
+        Final[transcription.completed]
+        UserMsg[transcript.user]
+        Quote[citat i response.create]
+        Fraga[skärmen, frågan]
+        Live --> UserMsg
+        Final --> UserMsg
+        Final --> Quote
+        UserMsg --> Fraga
+    end
+    subgraph assistent [Assistenten]
+        Delta[output_audio_transcript.delta]
+        Done[output_audio_transcript.done]
+        AsstMsg[transcript.assistant]
+        Svar[skärmen, svaret]
+        Delta --> AsstMsg
+        Done --> AsstMsg
+        AsstMsg --> Svar
+    end
+```
+
+`transcript.user` är kumulativ: varje rad ersätter frågan. `transcript.assistant` med `cumulative: false` är ett delta och läggs till. Den avslutande assistentraden är hela svaret. `status` är `thinking`, sedan `speaking`, sedan `idle` på `response.done`. UTF-8 behålls i protokollet. Skärmen viker åäö till a och o.
+
 ## xAI-session
 
 Anslutning, från guiden och API-referensen:
@@ -46,7 +144,7 @@ Payload som relayn skickar:
 | `instructions` | Svenska regler under guidens engelska avsnittsnamn. Primärt svenska, inget norskt eller danskt, engelska bara som inflikade ord, extremt kort, upprepa inte frågan. | Guiden säger att extra språk styrs i instruktionen, och att avsnittsnamnen ska ligga nära träningsformen. |
 | `turn_detection.type` | `null` | `input_audio_buffer.commit` finns bara när turn detection är null. PTT är den manuella vägen. |
 | `audio.input.format` | `audio/pcm`, 16000 | PCM-takter som dokumentationen listar: 8000, 16000, 22050, 24000, 32000, 44100, 48000. 16000 beskrivs som wideband, bra för tal. |
-| `audio.output.format` | `audio/pcm`, enhetens `playback_rate` | Firmware ber om 44100. Det är CD-kvalitet i PCM-listan, samma takt som AirPods spelar, så relayn inte samplar om. |
+| `audio.output.format` | `audio/pcm`, enhetens `playback_rate` | Plus2 ber om 16000, så PCM får plats bredvid A2DP. Stickan samplar upp till 44100 lokalt. Relayn samplar inte om när takten redan stämmer. |
 | `audio.*.transport` | `binary` | Rå PCM16 little-endian i binära frames. JSON-händelser (transkript, status) stannar text. |
 | `resumption.enabled` | `true` | `conversation.created.conversation.id` sparas i relayns minne, hashat per enhetstoken, och skickas som `conversation_id` vid återanslutning. Historiken faller efter 30 minuters inaktivitet. |
 | `audio.input.transcription.model` | `grok-transcribe` | Se TODO. Behövs enligt kompatibilitetsnoten för live-transkript av användaren. |
@@ -67,9 +165,9 @@ Upp: SPM1423 PDM → PCM16 mono 16 kHz → binär WebSocket-frame.
 
 Relayn resamplar till `XAI_INPUT_RATE` (default 16000). Lika takt är en kopia. Annars linjär interpolation, ett sample latens över chunk-gränsen, så att det inte klickar.
 
-Ned: xAI PCM16 vid den takt enheten anmälde i `hello.playback_rate` (firmware: 44100) → relayn kopierar när takterna är lika → binär frame. AirPods får varje mono-sample som vänster och höger. Summern och SPK2 spelar samma 44100. Hat SPK2 är av tills knapp B hålls inne. Strömknappen öppnar inställningsskärmen.
+Ned: xAI PCM16 vid den takt enheten anmälde i `hello.playback_rate` (Plus2: 16000) → relayn kopierar när takterna är lika → binär frame. Stickan samplar upp till 44100. AirPods får varje mono-sample som vänster och höger. Summern spelar 16000. Hat SPK2 är av tills knapp B hålls inne. Strömknappen öppnar inställningsskärmen.
 
-Summern är en 1-bitsmodulator. I2S-klockan ligger på 48 kHz, medan `playRaw` får 44100, så M5Unified samplar upp. Ringen är 256 KB i PSRAM och släpper bara hela samples. Två ljudbuffertar på 32 ms vardera ligger i kön så en skärmritning inte hinner tysta talet.
+Summern är en 1-bitsmodulator. I2S-klockan ligger på 48 kHz, medan `playRaw` får enhetens `playback_rate`, så M5Unified samplar upp. Ringen är 256 KB i PSRAM och släpper bara hela samples. Två ljudbuffertar på 32 ms vardera ligger i kön så en skärmritning inte hinner tysta talet.
 
 Serieporten tar ljudkommandon, en rad per tryck på retur (`pio device monitor -f send_on_enter`). `t` spelar en sekunds ton genom samma väg som svaret. `p` spelar senaste mottagna svaret igen, utan nytt anrop till xAI. `v` sätter volym 0–255, `r` sätter I2S-klockan, `m` sätter förstärkning 1–64. Stickan svarar `ljud v=… klocka=… mag=…`.
 
@@ -98,7 +196,7 @@ Chirp vid tryck är ett stigande pip, vid släpp ett fallande. Det är en TOS-li
 
 M5:s mic-exempel kör SPM1423 i 44100 Hz. 44100 finns i xAI:s PCM-lista. Firmware annonserar faktisk takt i `hello`, och relayn resamplar. TODO om 16 kHz PDM låter dåligt: höj `CAPTURE_HZ` till 44100.
 
-Hat SPK2-sidan säger både "32 kHz till 192 kHz" i punktlistan och "8 kHz ~ 96 kHz" i specifikationen. `playRaw` får 44100 och M5Unified samplar till I2S-klockan. Relayn följer `hello`.
+Hat SPK2-sidan säger både "32 kHz till 192 kHz" i punktlistan och "8 kHz ~ 96 kHz" i specifikationen. `playRaw` får `playback_rate` och M5Unified samplar till I2S-klockan. Relayn följer `hello`.
 
 ## Enhetsprotokoll
 
@@ -108,7 +206,7 @@ Auth är bara `Authorization: Bearer <enhetstoken>`. Query `token` accepteras in
 
 Efter accept:
 
-1. Enheten skickar `{"type":"hello","capture_rate":16000,"playback_rate":44100,"format":"pcm16le","device_id":"stickc-plus2"}`.
+1. Enheten skickar `{"type":"hello","capture_rate":16000,"playback_rate":16000,"format":"pcm16le","device_id":"stickc-plus2"}`. Plus2 samplar upp svaret till 44100 efter att ramen har tagits emot.
 2. Relayn kopplar upp xAI, väntar på `session.updated`, svarar `hello.ok` med takterna och `conversation_id`.
 3. `{"type":"ptt","state":"down"|"up"}` ramar in binära PCM-frames.
 4. Relayn skickar binär PCM ned, plus JSON:
