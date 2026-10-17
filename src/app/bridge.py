@@ -6,6 +6,7 @@ import array
 import asyncio
 import json
 import logging
+from collections import deque
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -29,6 +30,9 @@ log = logging.getLogger("kommunikator.bridge")
 # larger than 15 KiB, and that local close has no close code. Keep each
 # downlink frame well under that limit.
 _DEVICE_AUDIO_CHUNK = 3200
+# grok-transcribe can finish after the commit. Past this, quote the latest
+# partial that belongs to the committed item.
+_TRANSCRIPT_WAIT_S = 2.5
 
 
 class _Turn:
@@ -42,6 +46,14 @@ class _Turn:
         self.announced_speaking = False
         self.reply_pending = False
         self.user_transcript = ""
+        # item_id from input_audio_buffer.committed for the open turn.
+        # Transcript events for any other item stay off this quote.
+        self.item_id: str | None = None
+        self.provisional: dict[str, str] = {}
+        self.ready_items: set[str] = set()
+        self.pending_commits: deque[int] = deque()
+        self.response_id: str | None = None
+        self.ignored_responses: set[str] = set()
         self.device_bytes = 0
         self.answered_id: int | None = None
         self.level_peak = 0
@@ -94,6 +106,111 @@ def _stamp(message: dict, turn_id: int) -> dict:
     stamped = dict(message)
     stamped["turn"] = turn_id
     return stamped
+
+
+def _item_id(event: dict) -> str | None:
+    raw = event.get("item_id")
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
+
+
+def _response_id(event: dict) -> str | None:
+    raw = event.get("response_id")
+    if isinstance(raw, str) and raw:
+        return raw
+    response = event.get("response")
+    if isinstance(response, dict):
+        raw = response.get("id")
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
+
+
+def _user_line(turn: _Turn, text: str, final: bool) -> dict:
+    return {
+        "type": "transcript.user",
+        "text": text,
+        "final": final,
+        "cumulative": True,
+        "turn": turn.id,
+    }
+
+
+def _bind_committed(turn: _Turn, event: dict) -> dict | None:
+    """Attach this commit's item to the turn that sent it.
+
+    Completed events from two presses can pass each other. The item id on
+    input_audio_buffer.committed is what makes the quote belong to one press.
+    """
+    item_id = _item_id(event)
+    if not turn.pending_commits:
+        log.info("committed without a pending turn")
+        return None
+    owner = turn.pending_commits.popleft()
+    if not item_id:
+        log.info("committed without item_id turn %s", owner)
+        return None
+    if owner != turn.id:
+        log.info("committed for turn %s ignored, current is %s", owner, turn.id)
+        turn.provisional.pop(item_id, None)
+        turn.ready_items.discard(item_id)
+        return None
+    turn.item_id = item_id
+    stashed = turn.provisional.pop(item_id, "")
+    final = item_id in turn.ready_items
+    if stashed:
+        turn.user_transcript = stashed
+    if final:
+        turn.transcript_ready.set()
+    log.info("committed turn %s item %s", owner, item_id)
+    if not stashed:
+        return None
+    return _user_line(turn, stashed, final)
+
+
+def _take_user_transcript(turn: _Turn, event: dict) -> dict | None:
+    """Keep a transcript only when its item is the one this turn committed."""
+    heard = user_transcript(event)
+    if heard is None:
+        return None
+    text, final = heard
+    item_id = _item_id(event)
+    if not item_id:
+        log.info("user transcript without item_id turn %s", turn.id)
+        return None
+    if turn.item_id == item_id:
+        if text:
+            turn.user_transcript = text
+        if final:
+            turn.transcript_ready.set()
+        if not text:
+            return None
+        return _user_line(turn, text, final)
+    if text and (turn.capturing or turn.pending_commits):
+        turn.provisional[item_id] = text
+    if final:
+        turn.ready_items.add(item_id)
+    return None
+
+
+def _done_applies(turn: _Turn, event: dict) -> bool:
+    """A late done from a cancelled response must not clear the next one."""
+    rid = _response_id(event)
+    if rid and rid in turn.ignored_responses:
+        return False
+    if turn.response_id:
+        return rid == turn.response_id
+    return rid is None
+
+
+def _assistant_belongs(turn: _Turn, event: dict) -> bool:
+    rid = _response_id(event)
+    if rid and rid in turn.ignored_responses:
+        return False
+    if rid and turn.response_id:
+        return rid == turn.response_id
+    return True
 
 
 async def bridge(
@@ -228,9 +345,13 @@ async def _wait_session_updated(link: XaiLink, token: str, memory: ConversationM
 
 async def _answer_after_transcript(link, settings, turn, xai_lock, turn_id: int, send_json) -> None:
     try:
-        await asyncio.wait_for(turn.transcript_ready.wait(), timeout=2.5)
+        await asyncio.wait_for(turn.transcript_ready.wait(), timeout=_TRANSCRIPT_WAIT_S)
     except TimeoutError:
-        log.info("user transcript missing turn %s", turn_id)
+        log.info(
+            "user transcript missing turn %s partial %s",
+            turn_id,
+            len(turn.user_transcript.strip()),
+        )
     skipped = False
     adopted = False
     quote = ""
@@ -363,7 +484,6 @@ async def _device_to_xai(
                 turn.capturing = True
                 turn.sent_audio = False
                 turn.device_bytes = 0
-                turn.user_transcript = ""
                 turn.level_peak = 0
                 turn.level_sq = 0
                 turn.level_n = 0
@@ -371,16 +491,23 @@ async def _device_to_xai(
                 turn.format_error = None
                 turn.dumped = False
                 turn.level_logged = False
-                turn.transcript_ready.clear()
                 async with xai_lock:
+                    turn.user_transcript = ""
+                    turn.item_id = None
+                    turn.provisional.clear()
+                    turn.ready_items.clear()
+                    turn.transcript_ready.clear()
                     turn.reply_pending = False
                     turn.answered_id = None
                     turn.id = turn_id
                     turn.playing_id = None
                     turn.announced_speaking = False
+                    if turn.response_id:
+                        turn.ignored_responses.add(turn.response_id)
                     if turn.response_active:
                         await link.send(dumps({"type": "response.cancel"}))
                         turn.response_active = False
+                    turn.response_id = None
                     await link.send(dumps({"type": "input_audio_buffer.clear"}))
                 if turn.reply_task is not None and not turn.reply_task.done():
                     turn.reply_task.cancel()
@@ -397,11 +524,16 @@ async def _device_to_xai(
                         {"type": "relay", "event": "empty", "turn": up_id, "bytes": audio_bytes}
                     )
                     continue
-                turn.user_transcript = ""
-                turn.transcript_ready.clear()
                 committed = False
                 async with xai_lock:
                     if turn.id == up_id and turn.sent_audio:
+                        # Drop a quote that belongs to an earlier item. Partials
+                        # captured while the button was down stay in provisional
+                        # until this commit's item_id arrives.
+                        turn.user_transcript = ""
+                        turn.item_id = None
+                        turn.transcript_ready.clear()
+                        turn.pending_commits.append(up_id)
                         await link.send(dumps({"type": "input_audio_buffer.commit"}))
                         turn.reply_pending = True
                         turn.sent_audio = False
@@ -453,33 +585,66 @@ async def _xai_to_device(link, downlink, turn, send_json, send_bytes, xai_lock) 
         event = json.loads(raw)
         kind = str(event.get("type") or "")
         log.info("xai %s turn %s", _brief(event), turn.id)
-        heard = user_transcript(event)
-        if heard is not None:
-            text, final = heard
-            if text:
-                turn.user_transcript = text
-            if final:
-                turn.transcript_ready.set()
-        if kind == "response.created":
+        if kind == "conversation.created":
+            continue
+        # Set this before taking the lock. The reply task adopts a response
+        # the server already opened, and it reads the flag while commit
+        # still holds the lock.
+        rid = _response_id(event)
+        created_ignored = kind == "response.created" and bool(rid and rid in turn.ignored_responses)
+        if kind == "response.created" and not created_ignored:
             turn.response_active = True
             turn.announced_speaking = False
-            async with xai_lock:
-                if turn.reply_pending:
-                    turn.playing_id = turn.id
-                    turn.reply_pending = False
-                    turn.answered_id = turn.id
-        elif kind == "response.done":
-            turn.response_active = False
-        elif kind == "conversation.created":
-            continue
+            if rid:
+                turn.response_id = rid
+        publish: list[dict] = []
+        clear_playing = False
         async with xai_lock:
+            done_applies = _done_applies(turn, event) if kind == "response.done" else False
+            if kind == "input_audio_buffer.committed":
+                message = _bind_committed(turn, event)
+                if message is not None:
+                    publish.append(message)
+            elif user_transcript(event) is not None:
+                message = _take_user_transcript(turn, event)
+                if message is not None:
+                    publish.append(message)
+            elif kind == "response.created" and not created_ignored and turn.reply_pending:
+                turn.playing_id = turn.id
+                turn.reply_pending = False
+                turn.answered_id = turn.id
+            elif kind == "response.done" and done_applies:
+                turn.response_active = False
+                turn.response_id = None
+                clear_playing = True
+            elif kind == "response.done":
+                log.info(
+                    "response.done ignored %s active %s",
+                    rid or "-",
+                    turn.response_id or "-",
+                )
             play = turn.playing_id
             label = turn.id if play is None else play
-        for message in map_server_event(event):
+        for message in publish:
+            await send_json(message)
+        mapped = [
+            message
+            for message in map_server_event(event)
+            if message.get("type") != "transcript.user"
+        ]
+        if kind == "response.done" and not done_applies:
+            mapped = [message for message in mapped if message.get("state") != "idle"]
+        if created_ignored:
+            mapped = [message for message in mapped if message.get("type") != "status"]
+        if not _assistant_belongs(turn, event):
+            mapped = [
+                message for message in mapped if message.get("type") != "transcript.assistant"
+            ]
+        for message in mapped:
             if message.get("type") == "status" and play is None:
                 continue
             await send_json(_stamp(message, label))
-        if kind == "response.done":
+        if clear_playing:
             async with xai_lock:
                 if turn.playing_id == play:
                     turn.playing_id = None

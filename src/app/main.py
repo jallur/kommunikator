@@ -114,7 +114,7 @@ def create_app(
             except RuntimeError:
                 return
 
-    @app.post("/v1/missions", status_code=501)
+    @app.post("/v1/missions")
     async def create_mission(
         mission: Mission,
         authorization: str | None = Header(default=None),
