@@ -661,10 +661,9 @@ static void serviceAirpods() {
   } else if (prev == ESP_A2D_CONNECTION_STATE_CONNECTED &&
              now == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     Serial.println("bt slapp");
-    portENTER_CRITICAL(&stMux);
-    stR = 0;
-    stW = 0;
-    portEXIT_CRITICAL(&stMux);
+    // The mono ring is the buzzer copy. Nothing drains it while the buds
+    // play, so taking them off would speak the whole story again.
+    ringClear();
     airpodLatched = false;
     airpodPrerollLeft = 0;
     if (state != RunState::Wifi) esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
