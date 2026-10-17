@@ -1,0 +1,31 @@
+# Relay on cloud01, checkout /home/grok/kommunikator.
+# trek.aldenback.com TLS terminates on the external proxy network.
+# The process speaks plain HTTP on 0.0.0.0:8090. Port comes from PORT in .env.
+
+services:
+  kommunikator-relay:
+    build: ./src
+    env_file:
+      - .env
+    # KOMM_DUMP_AUDIO=1 writes one WAV per turn here. The flag stays off
+    # until someone wants to hear what xAI received.
+    volumes:
+      - ./data/uplink:/var/lib/kommunikator/audio
+    restart: unless-stopped
+    networks:
+      - proxy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; port=os.environ.get('PORT','8090'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health')",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  proxy:
+    external: true
