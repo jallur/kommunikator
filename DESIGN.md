@@ -93,7 +93,7 @@ flowchart LR
 
 Upp är redan 16 kHz, så relayn kopierar när `XAI_INPUT_RATE` också är 16000. Ned är den takt `hello.playback_rate` bad om. Plus2 ber om 16000. Relayn kopierar den takten och delar upp i ramar under 15 KiB. Första ljudramen kommer först efter `status speaking` för samma tur. Ljud som kommer innan dess, eller efter `response.done`, släpps.
 
-AirPods spelar stereoringen. Summern har en egen mono-kopia. Den töms när lurarna släpper, så ett redan spelat svar inte berättas om.
+AirPods spelar stereoringen. Summern har en egen mono-kopia som inte spelas medan lurarna är uppe. Den kopian ligger kvar, så samma svar kan höras en gång till i summern när lurarna släpper. Det är en känd bugg.
 
 ### Text
 

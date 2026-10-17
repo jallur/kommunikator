@@ -661,9 +661,13 @@ static void serviceAirpods() {
   } else if (prev == ESP_A2D_CONNECTION_STATE_CONNECTED &&
              now == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     Serial.println("bt slapp");
-    // The mono ring is the buzzer copy. Nothing drains it while the buds
-    // play, so taking them off would speak the whole story again.
-    ringClear();
+    // Drop the stereo tail so the buds do not speak the ending again when
+    // they return. The mono ring is left for the buzzer. That replays the
+    // story, and that replay is a known bug.
+    portENTER_CRITICAL(&stMux);
+    stR = 0;
+    stW = 0;
+    portEXIT_CRITICAL(&stMux);
     airpodLatched = false;
     airpodPrerollLeft = 0;
     if (state != RunState::Wifi) esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
@@ -1769,7 +1773,6 @@ static void beginPtt() {
   capQueued = false;
   capLive = false;
   ringClear();
-  setAirpodMedia(false);
   // Wi-Fi priority drops the AirPods link while the microphone is open.
   // The socket still has to move, so share the radio when the buds are up.
   esp_coex_preference_set(airpodsOn() ? ESP_COEX_PREFER_BALANCE : ESP_COEX_PREFER_WIFI);
@@ -1812,7 +1815,6 @@ static void abortActivity() {
   stopMic();
   M5.Speaker.stop();
   ringClear();
-  setAirpodMedia(false);
   esp_coex_preference_set(airpodsOn() ? ESP_COEX_PREFER_BALANCE : ESP_COEX_PREFER_WIFI);
   if (wasPtt && sessionReady) sendPtt("up");
   if (!airpodsOn() && !M5.Speaker.isRunning()) startSpeaker();
@@ -2280,7 +2282,10 @@ static void servicePlayback() {
       fed = feed;
       logAudio(feed ? "spela" : "vantar");
     }
-    setAirpodMedia(feed);
+    // Keep the stream up for the whole time the buds are connected.
+    // Suspending it and starting again while the reply is arriving makes
+    // the START ack land after the ring has overwritten the beginning.
+    setAirpodMedia(true);
     // Stay in balance for the whole time the buds are connected, including
     // the wait after the button. Wi-Fi priority during that wait is what
     // drops the link before the answer arrives.
