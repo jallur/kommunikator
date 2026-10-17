@@ -24,9 +24,9 @@
 #define KOMM_CA_CERT ISRG_ROOT_X1
 #endif
 
-// Rates come from the board profile. Plus2 asks for 44.1 kHz because that
-// is what its AirPods sink plays. S3 boards ask for 24 kHz and play it
-// on their own speaker.
+// Rates come from the board profile. Plus2 asks for 16 kHz on the wire
+// and upsamples to 44.1 kHz for AirPods. S3 boards ask for 24 kHz and play
+// it on their own speaker.
 static constexpr uint32_t CAPTURE_HZ = kBoard.captureHz;
 static constexpr uint32_t PLAYBACK_HZ = kBoard.playbackHz;
 static const size_t CAPTURE_SAMPLES = 320;  // 20 ms
