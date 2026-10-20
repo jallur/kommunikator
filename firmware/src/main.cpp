@@ -1010,13 +1010,27 @@ static bool installPdm(int dmaCount) {
 #endif
 
 static void micReader(void*) {
+#if KOMM_A2DP
   int16_t tmp[64];
+#else
+  // M5Unified keeps two record slots and sleeps when both are empty. The
+  // next record() then copies a DMA scrap and goes back to sleep, so a
+  // 64-sample buffer plus a poll sent about a tenth of the press (the
+  // relay quoted an empty utterance). Four blocks: two stay queued in the
+  // driver, and the block two behind the one just accepted is finished.
+  static int16_t block[4][CAPTURE_SAMPLES];
+  int queued = 0;
+#endif
   for (;;) {
     portENTER_CRITICAL(&micMux);
     bool run = micRun;
     if (run) micInRead = true;
     portEXIT_CRITICAL(&micMux);
     if (!run) {
+#if !KOMM_A2DP
+      queued = 0;
+#endif
+      micInRead = false;
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
@@ -1047,18 +1061,18 @@ static void micReader(void*) {
     micInRead = false;
     if (!pushed) vTaskDelay(pdMS_TO_TICKS(5));
 #else
-    size_t got = 0;
-    // Wait until the background task has actually started, then until it
-    // has filled tmp. isRecording() is also false before the task wakes,
-    // and treating that as a finished buffer pushes stack noise.
-    if (M5.Mic.record(tmp, 64, CAPTURE_HZ, false)) {
-      for (int i = 0; i < 20 && !M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
-      for (int i = 0; i < 40 && M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
-      if (!M5.Mic.isRecording()) got = sizeof(tmp);
+    // record() returns at once when a slot is free and blocks while both
+    // are busy, so this task waits out one 20 ms block instead of polling
+    // past it. micInRead stays set across that wait; stopMic waits for it.
+    if (M5.Mic.record(block[queued & 3], CAPTURE_SAMPLES, CAPTURE_HZ, false)) {
+      queued++;
+      if (queued >= 3) micPush(block[(queued - 3) & 3], CAPTURE_SAMPLES);
+      if (queued == 3) {
+        Serial.printf("mic block %u\n", static_cast<unsigned>(CAPTURE_SAMPLES));
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
-    if (got >= sizeof(int16_t)) micPush(tmp, got / sizeof(int16_t));
-    micInRead = false;
-    if (got < sizeof(int16_t)) vTaskDelay(pdMS_TO_TICKS(5));
 #endif
   }
 }
@@ -1137,8 +1151,11 @@ static bool startMic() {
   return startPdmMic();
 #else
   auto mic = M5.Mic.config();
-  mic.dma_buf_count = 4;
-  mic.dma_buf_len = 64;
+  // A few DMA buffers so a short stall in the reader does not drop the
+  // ES7210 stream. The driver task sits above the reader.
+  mic.dma_buf_count = 8;
+  mic.dma_buf_len = 256;
+  mic.task_priority = 5;
   M5.Mic.config(mic);
   if (!M5.Mic.begin()) {
     Serial.println("mic begin nej");
