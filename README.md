@@ -78,10 +78,13 @@ Användning: knapp A inne medan du pratar, släpp när du är klar. Pip vid tryc
 
 CoreS3-SE, CoreS3 och CoreS3 Lite byggs med `cores3`. Samma bild körs på alla tre. PSRAM är quad (`qio_qspi`), som Arduino 2.0.16 sätter för CoreS3.
 
+Håll RST på undersidan inne i tre sekunder tills den gröna lampan tänds, och släpp. Då är enheten i nedladdningsläge. På macOS heter porten `/dev/cu.usbmodem…`. `/dev/cu.Bluetooth-Incoming-Port` är inte CoreS3. Syns ingen `usbmodem` är kabeln ofta bara laddning.
+
 ```bash
-cd firmware
-python -m platformio run -e cores3 -t upload
-python -m platformio device monitor -b 115200
+ls /dev/cu.usb*
+# byt usbmodem1101 mot namnet som ls skrev ut
+python -m platformio run -e cores3 -t upload --upload-port /dev/cu.usbmodem1101
+python -m platformio device monitor -b 115200 --port /dev/cu.usbmodem1101
 ```
 
 Skärmen är liggande, 320×240. De övre två tredjedelarna är texten. Under den ligger tre knappar: PTT hålls inne medan du pratar, INST öppnar volym och ljus, KAM tar en bild. Saknas sensorn, som på SE, står det `INGEN KAMERA`. Ett tryck i bilden tar en ny. Strömknappen vid start, eller inget sparat nät, öppnar portalen.
