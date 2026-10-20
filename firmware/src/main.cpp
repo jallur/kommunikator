@@ -1356,13 +1356,17 @@ static void onTextMessage(const char* payload, size_t length) {
     uint32_t turn = doc["turn"] | 0;
     if (turn != turnId) return;
     const char* name = doc["state"] | "";
+    // Binary frames have no turn id. Once this turn is idle, drop them.
+    // The relay sends the turn's audio before this status.
     if (strcmp(name, "speaking") == 0) hearTurn = true;
+    else if (strcmp(name, "idle") == 0 || strcmp(name, "error") == 0) hearTurn = false;
     applyStatus(name);
     return;
   }
   if (strcmp(type, "transcript.user") == 0) {
+    uint32_t turn = doc["turn"] | 0;
+    if (turn != turnId) return;
     userLine = "";
-    if (doc["cumulative"] | true) userLine = "";
     foldUtf8(userLine, doc["text"] | "", 160);
     uiDirty = true;
     return;
@@ -1383,6 +1387,7 @@ static void onTextMessage(const char* payload, size_t length) {
     return;
   }
   if (strcmp(type, "error") == 0) {
+    hearTurn = false;
     setState(RunState::Error);
     detailLine = "";
     foldUtf8(detailLine, doc["message"] | "fel", 80);
