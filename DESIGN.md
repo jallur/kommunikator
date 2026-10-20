@@ -10,6 +10,8 @@ Hämtat mot docs.x.ai 2026-10-15. Endpoints som inte står i de sidorna finns in
 - [Ephemeral tokens](https://docs.x.ai/developers/model-capabilities/audio/ephemeral-tokens) — används inte av enheten
 - [Speech to Speech model page](https://docs.x.ai/developers/models/realtime-api) — max session 120 minuter
 - [StickC-Plus2](https://docs.m5stack.com/en/core/StickC-Plus2)
+- [CoreS3-SE](https://docs.m5stack.com/en/core/CoreS3-SE) — samma skärm, mick och högtalare som Lite, ingen GC0308
+- [CoreS3 Lite](https://docs.m5stack.com/en/core/CoreS3-Lite) — GC0308, 200 mAh
 - [Hat SPK2](https://docs.m5stack.com/en/hat/Hat-SPK2)
 - [SPEAKER2.ino](https://github.com/m5stack/M5StickC-Plus/blob/master/examples/Hat/SPEAKER2/SPEAKER2.ino) — I2S-pinnar på Stick-hatten
 - M5Unified 0.2.5 sätter Plus2-batteri till ADC på GPIO38 med faktor 2
@@ -230,6 +232,14 @@ ST7789 135×240, liggande (rotation 1), bärnstensfärg på svart. Inbyggda Font
 Lägen: `START`, `PORTAL`, `WIFI`, `KOPPLAR`, `REDO`, `LYSSNAR`, `VANTAR`, `SVARAR`, `FEL`.
 
 Knapp A (GPIO37) är PTT. Knapp B (GPIO39), kort tryck, bläddrar en sida av svaret och går tillbaka till början efter sista sidan. Håll inne B för att växla SPK2/summer. Knapp B intryckt vid start, eller saknat Wi-Fi, öppnar portalen. Knapp C (GPIO35) är väckning/av och används inte som UI.
+
+### CoreS3, CoreS3-SE, CoreS3 Lite
+
+Samma enhetsprotokoll och samma relay. `hello.device_id` är `cores3`. Uppspelning är 24 kHz i den inbyggda AW88298. Mikrofonen är ES7210 via M5Unified, inte Plus2:s PDM. Ingen klassisk Bluetooth, så ingen AirPods-väg. Tal och lyssning turas fortfarande om, eftersom PTT är halv-duplex.
+
+Skärmen är ILI9342, rotation 1, 320×240. Ritytan delas i tre rader och tre kolumner. Texten tar de övre två raderna (3×2). Längst ner tre knappar på 1×1: `PTT`, `INST`, `KAM`. PTT är nedtryckning, inte ett klick. INST öppnar samma inställningslista, utan SPK2 och utan lurar. Ett tryck i texten bläddrar svaret. Strömknappen på sidan gör samma sak som INST, och hålls den inne vid start öppnas portalen.
+
+KAM tar en RGB565-ruta från GC0308 och släpper kameradrivrutinen direkt, så pekskärmen får tillbaka I2C-porten. CoreS3-SE har ingen sensor. Registret `0x00` på adress `0x21` är inte `0x9b`, och rutan visar `INGEN KAMERA`. Ett tryck i bilden tar en ny ruta när sensorn finns.
 
 ## Wi-Fi och token
 
