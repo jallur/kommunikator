@@ -305,6 +305,109 @@ def test_empty_ptt_does_not_commit(settings) -> None:
     assert not any(item.get("type") == "input_audio_buffer.commit" for item in texts)
 
 
+def _texts(factory: FakeFactory) -> list[dict]:
+    return [json.loads(item) for item in factory.links[0].sent if isinstance(item, str)]
+
+
+def _read_until(ws, pred, limit: int = 24) -> list[dict]:
+    found = []
+    for _ in range(limit):
+        message = ws.receive()
+        text = message.get("text")
+        body = json.loads(text) if text else {}
+        found.append(body if text else {"bytes": len(message.get("bytes") or b"")})
+        if pred(body):
+            return found
+    raise AssertionError(found)
+
+
+def test_late_transcript_from_the_previous_press_is_not_quoted(settings) -> None:
+    factory = FakeFactory(mode="race")
+    client = TestClient(create_app(settings, factory))
+    pcm = b"\x00\x01" * 160
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down", "turn": 1})
+        ws.send_bytes(pcm)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 1})
+        ws.send_json({"type": "ptt", "state": "down", "turn": 2})
+        ws.send_bytes(pcm)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 2})
+        seen = _read_until(ws, lambda body: body.get("text") == "andra frågan")
+    created = [item for item in _texts(factory) if item.get("type") == "response.create"]
+    assert len(created) == 1
+    instructions = created[0]["response"]["instructions"]
+    assert "andra frågan" in instructions
+    assert "första frågan" not in instructions
+    texts = [body.get("text") for body in seen]
+    assert "andra frågan" in texts
+    assert "första frågan" not in texts
+
+
+def test_partial_transcript_is_quoted_when_completed_does_not_arrive(monkeypatch, settings) -> None:
+    monkeypatch.setattr("app.bridge._TRANSCRIPT_WAIT_S", 0.2)
+    factory = FakeFactory(mode="partial")
+    client = TestClient(create_app(settings, factory))
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down", "turn": 4})
+        ws.send_bytes(b"\x00\x01" * 160)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 4})
+        _read_until(
+            ws,
+            lambda body: body.get("type") == "relay" and body.get("event") == "answer",
+        )
+    created = [item for item in _texts(factory) if item.get("type") == "response.create"]
+    assert len(created) == 1
+    assert "delvis fråga" in created[0]["response"]["instructions"]
+
+
+def test_late_response_done_does_not_drop_the_next_response(settings) -> None:
+    factory = FakeFactory(mode="late_done")
+    client = TestClient(create_app(settings, factory))
+    pcm = b"\x00\x01" * 160
+    with client.websocket_connect(
+        "/ws",
+        headers={"Authorization": "Bearer device-token-a"},
+    ) as ws:
+        ws.send_json(HELLO)
+        assert ws.receive_json()["type"] == "hello.ok"
+        ws.send_json({"type": "ptt", "state": "down", "turn": 1})
+        ws.send_bytes(pcm)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 1})
+        first = _read_until(ws, lambda body: body.get("text") == "Hej" or body.get("delta") == "Hej" or (
+            body.get("type") == "transcript.assistant" and body.get("text") == "Hej"
+        ))
+        assert not any(body.get("state") == "idle" for body in first)
+        ws.send_json({"type": "ptt", "state": "down", "turn": 2})
+        ws.send_bytes(pcm)
+        ws.send_json({"type": "ptt", "state": "up", "turn": 2})
+        second = _read_until(
+            ws,
+            lambda body: body.get("type") == "transcript.assistant" and body.get("text") == "Hej",
+        )
+        assert not any(body.get("state") == "idle" for body in second)
+        factory.links[0].push(
+            {"type": "error", "error": {"code": "synk", "message": "synk"}}
+        )
+        synced = _read_until(ws, lambda body: body.get("code") == "synk")
+        assert not any(body.get("state") == "idle" for body in synced)
+        ws.send_json({"type": "ptt", "state": "down", "turn": 3})
+        ws.send_json({"type": "ping"})
+        pong = ws.receive_json()
+        assert pong["type"] == "pong"
+    cancels = [item for item in _texts(factory) if item.get("type") == "response.cancel"]
+    assert len(cancels) == 2
+
+
 def test_missing_api_key_fails_closed(settings) -> None:
     from dataclasses import replace
 

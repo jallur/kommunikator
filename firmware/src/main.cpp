@@ -1,6 +1,9 @@
-// Kommunikator firmware for M5StickC Plus2.
-// Push-to-talk on button A, PDM mic uplink, onboard buzzer playback.
+// Kommunikator firmware.
+// M5StickC Plus2: push-to-talk on button A, PDM mic, buzzer or Hat SPK2.
 // Button B pages the answer. A long press still selects Hat SPK2.
+// CoreS3, CoreS3-SE and CoreS3 Lite: the same session on a touch panel.
+// The text sits in the top 3x2 cells. PTT, settings and camera are the
+// three buttons along the bottom. SE has no camera; the button says so.
 // The xAI API key never lives here. The device only knows a relay token.
 
 #include <M5Unified.h>
@@ -22,6 +25,10 @@
 #include <sys/socket.h>
 
 #include "config.h"
+
+#if defined(KOMM_BOARD_CORES3)
+#include <esp_camera.h>
+#endif
 
 #if KOMM_A2DP
 #include <esp_a2dp_api.h>
@@ -152,6 +159,16 @@ static uint8_t screenBright = 170;
 static bool setupOpen = false;
 static bool swallowPwrClick = false;
 static int setupSel = 0;
+// CoreS3 family. The picture is one RGB565 frame in PSRAM, shown in the
+// text area. The camera driver is not left running: it wants the same
+// I2C port as touch, the PMIC and the codecs.
+static bool cameraView = false;
+static bool cameraReady = false;
+static bool cameraMissing = false;
+static uint16_t* cameraFrame = nullptr;
+static int cameraW = 0;
+static int cameraH = 0;
+static bool touchPtt = false;
 // Plus2's buzzer is a 1-bit modulator and wants a fast I2S clock.
 // S3 boards play the PCM rate the profile asked the relay for.
 static uint32_t playClock = KOMM_A2DP ? 48000u : PLAYBACK_HZ;
@@ -993,13 +1010,27 @@ static bool installPdm(int dmaCount) {
 #endif
 
 static void micReader(void*) {
+#if KOMM_A2DP
   int16_t tmp[64];
+#else
+  // M5Unified keeps two record slots and sleeps when both are empty. The
+  // next record() then copies a DMA scrap and goes back to sleep, so a
+  // 64-sample buffer plus a poll sent about a tenth of the press (the
+  // relay quoted an empty utterance). Four blocks: two stay queued in the
+  // driver, and the block two behind the one just accepted is finished.
+  static int16_t block[4][CAPTURE_SAMPLES];
+  int queued = 0;
+#endif
   for (;;) {
     portENTER_CRITICAL(&micMux);
     bool run = micRun;
     if (run) micInRead = true;
     portEXIT_CRITICAL(&micMux);
     if (!run) {
+#if !KOMM_A2DP
+      queued = 0;
+#endif
+      micInRead = false;
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
@@ -1030,18 +1061,18 @@ static void micReader(void*) {
     micInRead = false;
     if (!pushed) vTaskDelay(pdMS_TO_TICKS(5));
 #else
-    size_t got = 0;
-    // Wait until the background task has actually started, then until it
-    // has filled tmp. isRecording() is also false before the task wakes,
-    // and treating that as a finished buffer pushes stack noise.
-    if (M5.Mic.record(tmp, 64, CAPTURE_HZ, false)) {
-      for (int i = 0; i < 20 && !M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
-      for (int i = 0; i < 40 && M5.Mic.isRecording(); i++) vTaskDelay(pdMS_TO_TICKS(2));
-      if (!M5.Mic.isRecording()) got = sizeof(tmp);
+    // record() returns at once when a slot is free and blocks while both
+    // are busy, so this task waits out one 20 ms block instead of polling
+    // past it. micInRead stays set across that wait; stopMic waits for it.
+    if (M5.Mic.record(block[queued & 3], CAPTURE_SAMPLES, CAPTURE_HZ, false)) {
+      queued++;
+      if (queued >= 3) micPush(block[(queued - 3) & 3], CAPTURE_SAMPLES);
+      if (queued == 3) {
+        Serial.printf("mic block %u\n", static_cast<unsigned>(CAPTURE_SAMPLES));
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
-    if (got >= sizeof(int16_t)) micPush(tmp, got / sizeof(int16_t));
-    micInRead = false;
-    if (got < sizeof(int16_t)) vTaskDelay(pdMS_TO_TICKS(5));
 #endif
   }
 }
@@ -1120,8 +1151,11 @@ static bool startMic() {
   return startPdmMic();
 #else
   auto mic = M5.Mic.config();
-  mic.dma_buf_count = 4;
-  mic.dma_buf_len = 64;
+  // A few DMA buffers so a short stall in the reader does not drop the
+  // ES7210 stream. The driver task sits above the reader.
+  mic.dma_buf_count = 8;
+  mic.dma_buf_len = 256;
+  mic.task_priority = 5;
   M5.Mic.config(mic);
   if (!M5.Mic.begin()) {
     Serial.println("mic begin nej");
@@ -1224,7 +1258,9 @@ static void sendPtt(const char* edge) {
 }
 
 static const int kAnswerRows = 48;
-static const int kAnswerCols = 42;
+// Wide enough for the CoreS3's 320 px line. Plus2 wraps on pixel width
+// before it reaches this cap.
+static const int kAnswerCols = 72;
 static char answerRows[kAnswerRows][kAnswerCols];
 static int answerRowsN = 0;
 static int answerScroll = 0;
@@ -1236,8 +1272,15 @@ static int lineHeightPx() {
 
 static int answerOriginY() { return 2 + lineHeightPx() * 2; }
 
+// Touch boards keep the bottom third for three buttons. The text area
+// above them is two of those rows, so the grid is 3 columns by 3 rows.
+static int textBottom() {
+  if (!kBoard.touchUi) return M5.Display.height();
+  return M5.Display.height() - M5.Display.height() / 3;
+}
+
 static int answerVisible() {
-  int n = (M5.Display.height() - answerOriginY() - 2) / lineHeightPx();
+  int n = (textBottom() - answerOriginY() - 2) / lineHeightPx();
   return n > 0 ? n : 1;
 }
 
@@ -1330,13 +1373,17 @@ static void onTextMessage(const char* payload, size_t length) {
     uint32_t turn = doc["turn"] | 0;
     if (turn != turnId) return;
     const char* name = doc["state"] | "";
+    // Binary frames have no turn id. Once this turn is idle, drop them.
+    // The relay sends the turn's audio before this status.
     if (strcmp(name, "speaking") == 0) hearTurn = true;
+    else if (strcmp(name, "idle") == 0 || strcmp(name, "error") == 0) hearTurn = false;
     applyStatus(name);
     return;
   }
   if (strcmp(type, "transcript.user") == 0) {
+    uint32_t turn = doc["turn"] | 0;
+    if (turn != turnId) return;
     userLine = "";
-    if (doc["cumulative"] | true) userLine = "";
     foldUtf8(userLine, doc["text"] | "", 160);
     uiDirty = true;
     return;
@@ -1357,6 +1404,7 @@ static void onTextMessage(const char* payload, size_t length) {
     return;
   }
   if (strcmp(type, "error") == 0) {
+    hearTurn = false;
     setState(RunState::Error);
     detailLine = "";
     foldUtf8(detailLine, doc["message"] | "fel", 80);
@@ -1654,6 +1702,9 @@ static void loadConfig() {
   }
   playVolume = prefs.getUChar("vol", playVolume);
   screenBright = prefs.getUChar("bright", screenBright);
+  // GPIO2 is the Plus2 buzzer and PORT.A on CoreS3. A saved SPK2 flag
+  // must not steer the chirp onto that pin.
+  if (!kBoard.a2dp) useSpk2 = false;
 #ifdef KOMM_WIFI_SSID
   if (wifiSsid.length() == 0) wifiSsid = KOMM_WIFI_SSID;
 #ifdef KOMM_WIFI_PASS
@@ -1873,6 +1924,12 @@ static void printFitted(const char* text, int maxW);
 
 static const int kSetupRows = 7;
 
+// Hat SPK2 and AirPods are Plus2 only. The rows stay in place there.
+static bool setupRowVisible(int row) {
+  if (kBoard.a2dp) return true;
+  return row != 1 && row != 6;
+}
+
 static void bumpVolume() {
   int next = (static_cast<int>(playVolume) / 25 + 1) * 25;
   if (next > 250) next = 0;
@@ -1894,7 +1951,7 @@ static void bumpBright() {
 
 static void adjustSetup() {
   if (setupSel == 0) bumpVolume();
-  else if (setupSel == 1) toggleOutput();
+  else if (setupSel == 1 && kBoard.a2dp) toggleOutput();
   else if (setupSel == 2) bumpBright();
   uiDirty = true;
   markActivity();
@@ -1940,17 +1997,24 @@ static const char* setupLabel(int row) {
 }
 
 static void drawSetup() {
-  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.fillRect(0, 0, M5.Display.width(), textBottom(), TFT_BLACK);
   M5.Display.setTextColor(0xFD20, TFT_BLACK);
+  M5.Display.setTextSize(1);
   M5.Display.setTextWrap(false);
   int lh = lineHeightPx();
   M5.Display.setCursor(4, 2);
   M5.Display.print("INSTALLNING");
-  const char* hint = "PWR";
-  M5.Display.setCursor(M5.Display.width() - M5.Display.textWidth(hint) - 4, 2);
-  M5.Display.print(hint);
+  if (!kBoard.touchUi) {
+    const char* hint = "PWR";
+    M5.Display.setCursor(M5.Display.width() - M5.Display.textWidth(hint) - 4, 2);
+    M5.Display.print(hint);
+  }
+  int shown = 0;
   for (int row = 0; row < kSetupRows; row++) {
-    int y = 2 + lh + row * lh;
+    if (!setupRowVisible(row)) continue;
+    int y = 2 + lh + shown * lh;
+    shown++;
+    if (y >= textBottom()) break;
     M5.Display.setCursor(2, y);
     M5.Display.print(row == setupSel ? ">" : " ");
     const char* label = setupLabel(row);
@@ -1984,20 +2048,76 @@ static void printFitted(const char* text, int maxW) {
   M5.Display.print(buf);
 }
 
+static const uint16_t kAmber = 0xFD20;
+
+static void drawButtons() {
+  if (!kBoard.touchUi) return;
+  const char* labels[3] = {"PTT", "INST", "KAM"};
+  bool on[3] = {pttHeld, setupOpen, cameraView};
+  int width = M5.Display.width();
+  int height = M5.Display.height();
+  int btnH = height / 3;
+  int y = height - btnH;
+  int col = width / 3;
+  for (int i = 0; i < 3; i++) {
+    int x = i * col;
+    int bw = (i == 2) ? width - x : col;
+    uint16_t bg = on[i] ? kAmber : TFT_BLACK;
+    uint16_t ink = on[i] ? TFT_BLACK : kAmber;
+    M5.Display.fillRect(x, y, bw, btnH, bg);
+    M5.Display.drawRect(x, y, bw, btnH, kAmber);
+    M5.Display.setTextColor(ink, bg);
+    M5.Display.setTextSize(2);
+    if (M5.Display.textWidth(labels[i]) > bw - 8) M5.Display.setTextSize(1);
+    int tw = M5.Display.textWidth(labels[i]);
+    int th = M5.Display.fontHeight();
+    M5.Display.setCursor(x + (bw - tw) / 2, y + (btnH - th) / 2);
+    M5.Display.print(labels[i]);
+  }
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(kAmber, TFT_BLACK);
+}
+
+static void drawCameraView() {
+  int bottom = textBottom();
+  M5.Display.fillRect(0, 0, M5.Display.width(), bottom, TFT_BLACK);
+  M5.Display.setTextColor(kAmber, TFT_BLACK);
+  M5.Display.setTextSize(1);
+  if (cameraReady && cameraFrame && cameraW > 0 && cameraH > 0) {
+    M5.Display.setClipRect(0, 0, M5.Display.width(), bottom);
+    int x = (M5.Display.width() - cameraW) / 2;
+    int y = (bottom - cameraH) / 2;
+    M5.Display.pushImage(x, y, cameraW, cameraH, cameraFrame);
+    M5.Display.clearClipRect();
+    return;
+  }
+  const char* msg = cameraMissing ? "INGEN KAMERA" : "TAR BILD";
+  int tw = M5.Display.textWidth(msg);
+  M5.Display.setCursor((M5.Display.width() - tw) / 2, bottom / 2 - lineHeightPx() / 2);
+  M5.Display.print(msg);
+}
+
 static void draw() {
   if (setupOpen) {
     drawSetup();
+    drawButtons();
+    uiDirty = false;
+    return;
+  }
+  if (kBoard.touchUi && cameraView) {
+    drawCameraView();
+    drawButtons();
     uiDirty = false;
     return;
   }
   M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.setTextColor(0xFD20, TFT_BLACK);
+  M5.Display.setTextColor(kAmber, TFT_BLACK);
   M5.Display.setTextWrap(false);
   int lh = lineHeightPx();
   M5.Display.setCursor(4, 2);
   M5.Display.printf("KOMM %s", stateName(state));
   char meta[24];
-  const char* outName = airpodsOn() ? "AIR" : (useSpk2 ? "SPK2" : "SUM");
+  const char* outName = airpodsOn() ? "AIR" : (useSpk2 ? "SPK2" : (kBoard.a2dp ? "SUM" : "SPK"));
   if (batteryMv > 0) snprintf(meta, sizeof(meta), "%dmV %s", batteryMv, outName);
   else snprintf(meta, sizeof(meta), "%s", outName);
   int metaW = M5.Display.textWidth(meta);
@@ -2022,11 +2142,217 @@ static void draw() {
     printFitted(answerRows[row], maxW);
   }
   if (answerRowsN > visible && answerScroll + visible < answerRowsN) {
-    int y = M5.Display.height() - 6;
+    int y = textBottom() - 6;
     int x = M5.Display.width() - 8;
-    M5.Display.fillTriangle(x, y, x + 6, y, x + 3, y + 5, 0xFD20);
+    M5.Display.fillTriangle(x, y, x + 6, y, x + 3, y + 5, kAmber);
   }
+  drawButtons();
   uiDirty = false;
+}
+
+#if defined(KOMM_BOARD_CORES3)
+static void restoreInternalI2c() {
+  if (M5.In_I2C.begin()) return;
+  M5.In_I2C.release();
+  M5.In_I2C.begin();
+}
+
+// GC0308 answers 0x21 and its chip id is 0x9b. CoreS3-SE has the pads and
+// no sensor, so this returns before the camera driver takes the I2C port.
+static bool cameraSensorPresent() {
+  uint8_t id = M5.In_I2C.readRegister8(0x21, 0x00, 100000);
+  Serial.printf("kamera id %02x\n", id);
+  return id == 0x9b;
+}
+
+static bool cameraCapture() {
+  if (!cameraSensorPresent()) return false;
+  if (!cameraFrame) {
+    cameraFrame = static_cast<uint16_t*>(
+        heap_caps_malloc(320 * 240 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!cameraFrame) {
+      Serial.println("kamera minne");
+      return false;
+    }
+  }
+  camera_config_t cfg = {};
+  cfg.pin_pwdn = -1;
+  cfg.pin_reset = -1;
+  cfg.pin_xclk = -1;
+  cfg.pin_sccb_sda = 12;
+  cfg.pin_sccb_scl = 11;
+  cfg.pin_d7 = 47;
+  cfg.pin_d6 = 48;
+  cfg.pin_d5 = 16;
+  cfg.pin_d4 = 15;
+  cfg.pin_d3 = 42;
+  cfg.pin_d2 = 41;
+  cfg.pin_d1 = 40;
+  cfg.pin_d0 = 39;
+  cfg.pin_vsync = 46;
+  cfg.pin_href = 38;
+  cfg.pin_pclk = 45;
+  cfg.xclk_freq_hz = 20000000;
+  cfg.ledc_timer = LEDC_TIMER_3;
+  cfg.ledc_channel = LEDC_CHANNEL_6;
+  cfg.pixel_format = PIXFORMAT_RGB565;
+  cfg.frame_size = FRAMESIZE_QVGA;
+  cfg.jpeg_quality = 12;
+  cfg.fb_count = 1;
+  cfg.fb_location = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+  M5.In_I2C.release();
+  esp_err_t err = esp_camera_init(&cfg);
+  bool took = false;
+  if (err == ESP_OK) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb && fb->format == PIXFORMAT_RGB565 && fb->buf && fb->width > 0 && fb->height > 0 &&
+        fb->width <= 320 && fb->height <= 240 &&
+        fb->len >= static_cast<size_t>(fb->width) * fb->height * 2) {
+      memcpy(cameraFrame, fb->buf, static_cast<size_t>(fb->width) * fb->height * 2);
+      cameraW = fb->width;
+      cameraH = fb->height;
+      took = true;
+      Serial.printf("kamera %d x %d\n", cameraW, cameraH);
+    } else {
+      Serial.println("kamera tom ruta");
+    }
+    if (fb) esp_camera_fb_return(fb);
+    esp_camera_deinit();
+  } else {
+    Serial.printf("kamera fel %d\n", static_cast<int>(err));
+  }
+  restoreInternalI2c();
+  if (wsStarted) webSocket.loop();
+  return took;
+}
+#else
+static bool cameraCapture() { return false; }
+#endif
+
+static void leaveCamera() {
+  if (!cameraView) return;
+  cameraView = false;
+  uiDirty = true;
+}
+
+static void enterCamera() {
+  if (activityBusy() || state == RunState::Provision) return;
+  setupOpen = false;
+  cameraView = true;
+  cameraReady = false;
+  cameraMissing = false;
+  uiDirty = true;
+  draw();
+  bool took = cameraCapture();
+  cameraReady = took;
+  cameraMissing = !took;
+  uiDirty = true;
+  markActivity();
+  Serial.println(took ? "kamera bild" : "kamera ingen");
+}
+
+enum class TouchKey : uint8_t { None, Ptt, Setup, Camera, Text };
+
+static TouchKey touchKey(int x, int y) {
+  int width = M5.Display.width();
+  int height = M5.Display.height();
+  int top = height - height / 3;
+  if (y >= top) {
+    int col = width / 3;
+    if (x < col) return TouchKey::Ptt;
+    if (x < col * 2) return TouchKey::Setup;
+    return TouchKey::Camera;
+  }
+  if (x >= 0 && y >= 0) return TouchKey::Text;
+  return TouchKey::None;
+}
+
+static void pickSetupRow(int y) {
+  int lh = lineHeightPx();
+  int y0 = 2 + lh;
+  if (y < y0) return;
+  int index = (y - y0) / lh;
+  int seen = 0;
+  for (int row = 0; row < kSetupRows; row++) {
+    if (!setupRowVisible(row)) continue;
+    if (seen == index) {
+      setupSel = row;
+      adjustSetup();
+      return;
+    }
+    seen++;
+  }
+}
+
+static void serviceTouch() {
+  if (!kBoard.touchUi) return;
+  if (state == RunState::Provision) return;
+  if (!M5.Touch.isEnabled()) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      Serial.println("touch saknas");
+    }
+    return;
+  }
+  const auto& t = M5.Touch.getDetail();
+  if (touchPtt && !t.isPressed()) {
+    touchPtt = false;
+    if (pttHeld) {
+      Serial.println("ptt upp");
+      endPtt();
+    }
+  }
+  if (!t.wasPressed()) return;
+  switch (touchKey(t.x, t.y)) {
+    case TouchKey::Ptt:
+      if (cameraView) leaveCamera();
+      if (setupOpen) {
+        setupOpen = false;
+        uiDirty = true;
+      }
+      if (state == RunState::Wifi || state == RunState::Provision) {
+        Serial.println("ptt vantar nat");
+        break;
+      }
+      Serial.println("ptt ned");
+      beginPtt();
+      touchPtt = pttHeld;
+      break;
+    case TouchKey::Setup:
+      if (touchPtt || activityBusy()) break;
+      if (cameraView) leaveCamera();
+      setupOpen = !setupOpen;
+      uiDirty = true;
+      markActivity();
+      Serial.println(setupOpen ? "installning oppnas" : "installning stangs");
+      break;
+    case TouchKey::Camera:
+      if (touchPtt || activityBusy()) break;
+      if (cameraView) leaveCamera();
+      else enterCamera();
+      break;
+    case TouchKey::Text:
+      if (touchPtt || pttHeld) break;
+      if (setupOpen) pickSetupRow(t.y);
+      else if (cameraView) {
+        cameraReady = false;
+        cameraMissing = false;
+        draw();
+        bool took = cameraCapture();
+        cameraReady = took;
+        cameraMissing = !took;
+        uiDirty = true;
+        markActivity();
+      } else {
+        scrollAnswer();
+      }
+      break;
+    case TouchKey::None:
+      break;
+  }
 }
 
 static size_t takeCaptured(int16_t* dst, size_t maxn) {
@@ -2370,7 +2696,7 @@ void setup() {
   auto cfg = M5.config();
 #if defined(KOMM_BOARD_STICKS3)
   cfg.fallback_board = m5::board_t::board_M5StickS3;
-#elif defined(KOMM_BOARD_CORES3_LITE)
+#elif defined(KOMM_BOARD_CORES3)
   cfg.fallback_board = m5::board_t::board_M5StackCoreS3;
 #else
   cfg.fallback_board = m5::board_t::board_M5StickCPlus2;
@@ -2392,6 +2718,7 @@ void setup() {
   M5.Display.setFont(&fonts::Font2);
   M5.Display.setTextSize(1);
   M5.Display.setBrightness(screenBright);
+  Serial.printf("skarm %d x %d\n", M5.Display.width(), M5.Display.height());
   M5.Display.setTextWrap(false);
   M5.BtnB.setHoldThresh(700);
   speakerI2sLive = cfg.internal_spk || useSpk2;
@@ -2442,6 +2769,8 @@ void setup() {
       },
       "vakt", 3072, nullptr, 5, nullptr, 0);
   bool forcePortal = M5.BtnB.isPressed() || wifiSsid.length() == 0;
+  // CoreS3 has no button B. The side power button opens the portal.
+  if (kBoard.touchUi && M5.BtnPWR.isPressed()) forcePortal = true;
   if (forcePortal) enterProvision();
   else beginWifi();
   draw();
@@ -2451,6 +2780,7 @@ void loop() {
   loopMs = millis();
   M5.update();
   serviceSerial();
+  serviceTouch();
   if (wantAbort && listenLive && millis() - listenSince > 250) {
     uint8_t why = wantAbort;
     bool up = gpio_get_level(static_cast<gpio_num_t>(PIN_BTN_A)) != 0;
@@ -2490,9 +2820,15 @@ void loop() {
     if (pttHeld) serviceCapture();
     webSocket.loop();
   }
-  if (setupOpen) {
+  if (kBoard.touchUi) {
+    // PTT, settings and camera are on the glass. Buttons A and B are not
+    // wired on this family, and a stale edge must not start a second turn.
+  } else if (setupOpen) {
     if (M5.BtnB.wasClicked()) {
-      setupSel = (setupSel + 1) % kSetupRows;
+      for (int n = 0; n < kSetupRows; n++) {
+        setupSel = (setupSel + 1) % kSetupRows;
+        if (setupRowVisible(setupSel)) break;
+      }
       uiDirty = true;
       markActivity();
     }
