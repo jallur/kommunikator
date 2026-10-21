@@ -78,7 +78,7 @@ Användning: knapp A inne medan du pratar, släpp när du är klar. Pip vid tryc
 
 CoreS3-SE, CoreS3 och CoreS3 Lite byggs med `cores3`. Samma bild körs på alla tre. PSRAM är quad (`qio_qspi`), som Arduino 2.0.16 sätter för CoreS3.
 
-Håll RST på undersidan inne i tre sekunder tills den gröna lampan tänds, och släpp. Då är enheten i nedladdningsläge. På macOS heter porten `/dev/cu.usbmodem…`. `/dev/cu.Bluetooth-Incoming-Port` är inte CoreS3. Syns ingen `usbmodem` är kabeln ofta bara laddning.
+Håll RST på undersidan inne i tre sekunder tills den gröna lampan tänds, och släpp. Då är enheten i nedladdningsläge. På macOS heter porten `/dev/cu.usbmodem…`. `/dev/cu.Bluetooth-Incoming-Port` är inte CoreS3. Syns ingen `usbmodem` är kabeln ofta bara laddning. Uppladdningen går på 115200. USB-porten på macOS tappar kontakten om farten höjs till 1 500 000 efter att stubben startat, och esptool skriver då `No serial data received`. En bild på 1,2 MB tar omkring två minuter.
 
 ```bash
 ls /dev/cu.usb*
